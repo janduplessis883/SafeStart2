@@ -1,0 +1,7 @@
+streamlit
+pandas
+supabase
+fuzzywuzzy
+python-Levenshtein
+resend
+openpyxl
