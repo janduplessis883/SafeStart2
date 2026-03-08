@@ -15,6 +15,7 @@ SAFE_START2_ROOT = Path(__file__).parent
 sys.path.insert(0, str(SAFE_START2_ROOT))
 
 from safestart2.config import get_resend_settings, get_smsworks_settings
+from safestart2.messaging import build_email_message, build_outreach_message, first_name
 from safestart2.parser import load_dataframe, sanitize_dataframe_columns
 from safestart2.processing import INPUT_COLUMNS, process_immunizeme_dataframe
 from safestart2.resend_client import build_resend_requests, send_resend_requests
@@ -52,6 +53,160 @@ st.set_page_config(
 
 def _clear_session() -> None:
     st.session_state.pop("supabase_session", None)
+    _invalidate_data_caches()
+
+
+def _invalidate_data_caches() -> None:
+    st.session_state.pop("worklist_data_cache", None)
+    st.session_state.pop("vaccination_events_patient_cache", None)
+    st.session_state.pop("patient_timeline_cache", None)
+
+
+def _vaccination_events_cache_key(
+    user_context: UserContext,
+    surgery_id: Optional[str],
+    include_without_events: bool,
+) -> tuple[str, str, str, bool]:
+    return (
+        user_context.email,
+        str(user_context.role or ""),
+        str(surgery_id or ""),
+        include_without_events,
+    )
+
+
+def _get_cached_vaccination_event_patients(
+    store: SupabaseStore,
+    user_context: UserContext,
+    surgery_id: Optional[str],
+    include_without_events: bool,
+) -> list[dict]:
+    cache = st.session_state.setdefault("vaccination_events_patient_cache", {})
+    cache_key = _vaccination_events_cache_key(
+        user_context,
+        surgery_id=surgery_id,
+        include_without_events=include_without_events,
+    )
+    if cache_key not in cache:
+        cache[cache_key] = store.list_patients_with_vaccination_events(
+            user_context,
+            surgery_id=surgery_id,
+            include_without_events=include_without_events,
+        )
+    return list(cache[cache_key])
+
+
+def _patient_timeline_cache_key(
+    user_context: UserContext,
+    surgery_id: str,
+    nhs_number: str,
+) -> tuple[str, str, str, str]:
+    return (
+        user_context.email,
+        str(user_context.role or ""),
+        surgery_id,
+        nhs_number,
+    )
+
+
+def _get_cached_patient_timeline(
+    store: SupabaseStore,
+    user_context: UserContext,
+    surgery_id: str,
+    nhs_number: str,
+) -> dict:
+    cache = st.session_state.setdefault("patient_timeline_cache", {})
+    cache_key = _patient_timeline_cache_key(
+        user_context,
+        surgery_id=surgery_id,
+        nhs_number=nhs_number,
+    )
+    if cache_key not in cache:
+        cache[cache_key] = store.get_patient_timeline(
+            user_context=user_context,
+            surgery_id=surgery_id,
+            nhs_number=nhs_number,
+        )
+    return dict(cache[cache_key])
+
+
+def _apply_vaccination_event_exclusions(
+    patient: dict,
+    *,
+    excluded_vaccines: set[str],
+) -> dict:
+    vaccine_counts = {
+        str(vaccine): int(count or 0)
+        for vaccine, count in dict(patient.get("event_vaccine_counts") or {}).items()
+        if str(vaccine)
+    }
+    vaccine_last_dates = {
+        str(vaccine): value
+        for vaccine, value in dict(patient.get("event_vaccine_last_dates") or {}).items()
+        if str(vaccine)
+    }
+    filtered_vaccines = sorted(
+        vaccine for vaccine in vaccine_counts
+        if vaccine not in excluded_vaccines and int(vaccine_counts.get(vaccine) or 0) > 0
+    )
+    filtered_last_dates = [
+        vaccine_last_dates.get(vaccine)
+        for vaccine in filtered_vaccines
+        if vaccine_last_dates.get(vaccine)
+    ]
+    return {
+        **patient,
+        "event_count": sum(int(vaccine_counts.get(vaccine) or 0) for vaccine in filtered_vaccines),
+        "vaccine_count": len(filtered_vaccines),
+        "vaccines_display": ", ".join(filtered_vaccines),
+        "last_event_date": max((str(value) for value in filtered_last_dates), default=None),
+    }
+
+
+def _worklist_cache_key(
+    user_context: UserContext,
+    surgery_id: Optional[str],
+) -> tuple[str, str, str]:
+    return (
+        user_context.email,
+        str(user_context.role or ""),
+        str(surgery_id or ""),
+    )
+
+
+def _get_cached_worklist_data(
+    store: SupabaseStore,
+    user_context: UserContext,
+    surgery_id: Optional[str],
+) -> dict:
+    cache = st.session_state.setdefault("worklist_data_cache", {})
+    cache_key = _worklist_cache_key(user_context, surgery_id=surgery_id)
+    if cache_key not in cache:
+        recalls = store.list_active_recalls(user_context, surgery_id=surgery_id)
+        recommendation_ids = [str(row["id"]) for row in recalls if row.get("id")]
+        try:
+            attempt_rows = store.list_attempt_rows_for_recommendations(recommendation_ids)
+            attempt_error = None
+        except Exception as exc:
+            attempt_rows = []
+            attempt_error = (
+                "Workflow filters are unavailable until `sql/003_bulk_sms_batches.sql` is applied: "
+                f"{exc}"
+            )
+        try:
+            recall_batches = store.list_recall_batches(user_context, surgery_id=surgery_id)
+            recall_batch_error = None
+        except Exception as exc:
+            recall_batches = []
+            recall_batch_error = str(exc)
+        cache[cache_key] = {
+            "recalls": recalls,
+            "attempt_rows": attempt_rows,
+            "attempt_error": attempt_error,
+            "recall_batches": recall_batches,
+            "recall_batch_error": recall_batch_error,
+        }
+    return dict(cache[cache_key])
 
 
 def _build_store() -> tuple[SupabaseStore, Optional[str]]:
@@ -172,30 +327,17 @@ def _recall_option_label(recall: dict) -> str:
     )
 
 
-def _first_name(full_name: Optional[str]) -> str:
-    name = str(full_name or "").strip()
-    return name.split()[0] if name else "Patient"
-
-
 def _build_outreach_message(recall: dict, self_book_url: Optional[str] = None) -> str:
-    first_name = _first_name(recall.get("full_name"))
-    vaccines = recall.get("vaccines_display") or "your vaccines"
-    due_date = _format_date(recall.get("due_date"))
-    surgery_name = recall.get("surgery_name") or recall.get("surgery_code") or "your surgery"
-    if self_book_url:
-        return (
-            f"Dear {first_name}, you are due {vaccines} on {due_date}. "
-            f"Book here: {self_book_url} {surgery_name}"
-        )
-    return (
-        f"Dear {first_name}, you are due {vaccines} on {due_date}. "
-        f"We will send a self-book link to arrange this. {surgery_name}"
-    )
+    return build_outreach_message(recall, self_book_url=self_book_url)
 
 
 def _build_email_subject(recall: dict) -> str:
     surgery_name = recall.get("surgery_name") or recall.get("surgery_code") or "your surgery"
     return f"Vaccines due at {surgery_name}"
+
+
+def _build_email_message(recall: dict) -> str:
+    return build_email_message(recall)
 
 
 def _build_bulk_sms_rows(recalls: list[dict], self_book_url: Optional[str]) -> list[dict]:
@@ -207,7 +349,7 @@ def _build_bulk_sms_rows(recalls: list[dict], self_book_url: Optional[str]) -> l
                 "Group ID": recall["group_id"],
                 "Patient": recall.get("full_name") or "—",
                 "NHS Number": recall.get("nhs_number") or "—",
-                "Firstname": _first_name(recall.get("full_name")),
+                "Firstname": first_name(recall.get("full_name")),
                 "DOB": _format_date(recall.get("date_of_birth")),
                 "Phone": phone or "—",
                 "Vaccines": recall.get("vaccines_display") or "—",
@@ -342,22 +484,23 @@ def _build_bulk_sms_candidates(
 def _build_recall_batch_rows(recalls: list[dict], self_book_url: Optional[str]) -> list[dict]:
     rows = []
     for recall in recalls:
-        message = _build_outreach_message(recall, self_book_url=self_book_url)
+        sms_message = _build_outreach_message(recall, self_book_url=self_book_url)
+        email_message = _build_email_message(recall)
         rows.append(
             {
                 "Group ID": recall["group_id"],
                 "Patient": recall.get("full_name") or "—",
                 "NHS Number": recall.get("nhs_number") or "—",
-                "Firstname": _first_name(recall.get("full_name")),
+                "Firstname": first_name(recall.get("full_name")),
                 "DOB": _format_date(recall.get("date_of_birth")),
                 "Phone": str(recall.get("phone") or "").strip(),
                 "Email": str(recall.get("email") or "").strip(),
                 "Reply To": str(recall.get("surgery_email") or "").strip(),
                 "Vaccines": recall.get("vaccines_display") or "—",
                 "Due Date": _format_date(recall.get("due_date")),
-                "SMS Message": message,
+                "SMS Message": sms_message,
                 "Email Subject": _build_email_subject(recall),
-                "Email Message": message,
+                "Email Message": email_message,
                 "Recommendation IDs": list(recall.get("recommendation_ids") or []),
             }
         )
@@ -703,36 +846,71 @@ def _render_worklist_tab(
             key="worklist_surgery_filter",
         )
 
-    recalls = store.list_active_recalls(user_context, surgery_id=selected_surgery_id)
+    control_col1, control_col2, control_col3, _ = st.columns([0.18, 0.22, 0.26, 0.34])
+    if control_col1.button(
+        "Refresh data",
+        key="worklist_refresh_data",
+        icon=":material/refresh:",
+    ):
+        _invalidate_data_caches()
+        st.rerun()
+    exclude_flu_recalls = control_col2.toggle(
+        "Exclude Flu",
+        value=True,
+        key="worklist_exclude_flu",
+    )
+    exclude_covid_recalls = control_col3.toggle(
+        "Exclude COVID-19",
+        value=True,
+        key="worklist_exclude_covid19",
+    )
+
+    worklist_data = _get_cached_worklist_data(
+        store,
+        user_context,
+        surgery_id=selected_surgery_id,
+    )
+    attempt_error = worklist_data.get("attempt_error")
+    if attempt_error:
+        st.error(str(attempt_error))
+
+    excluded_vaccine_groups = set()
+    if exclude_flu_recalls:
+        excluded_vaccine_groups.add("Flu")
+    if exclude_covid_recalls:
+        excluded_vaccine_groups.add("COVID-19")
+
+    recalls = [
+        recall
+        for recall in worklist_data.get("recalls", [])
+        if str(recall.get("vaccine_group") or "") not in excluded_vaccine_groups
+    ]
     grouped_recalls = _group_recalls(recalls)
     if not grouped_recalls:
-        st.info("No active recalls are currently visible for this account and surgery filter.")
+        st.info("No active recalls are currently visible for this account, surgery filter, and vaccine exclusions.")
         return
 
-    all_group_recommendation_ids = [
-        recommendation_id
+    selected_recommendation_ids = {
+        str(recommendation_id)
         for recall in grouped_recalls
         for recommendation_id in recall.get("recommendation_ids", [])
+    }
+    all_attempt_rows = [
+        row
+        for row in worklist_data.get("attempt_rows", [])
+        if str(row.get("recommendation_id") or "") in selected_recommendation_ids
     ]
-    try:
-        all_attempt_rows = store.list_attempt_rows_for_recommendations(all_group_recommendation_ids)
-    except Exception as exc:
-        st.error(f"Workflow filters are unavailable until `sql/003_bulk_sms_batches.sql` is applied: {exc}")
-        all_attempt_rows = []
     attempts_by_group = _build_attempts_by_group(grouped_recalls, all_attempt_rows)
-    try:
-        recall_batches = store.list_recall_batches(user_context, surgery_id=selected_surgery_id)
-        recall_batch_error = None
-    except Exception as exc:
-        recall_batches = []
-        recall_batch_error = str(exc)
+    recall_batches = worklist_data.get("recall_batches", [])
+    recall_batch_error = worklist_data.get("recall_batch_error")
 
-    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1, metric2, metric3, metric4, metric5 = st.columns(5)
     metric1.metric("Patient Recalls", f"{len(grouped_recalls):,}")
-    metric2.metric("Overdue", f"{sum(item['status'] == 'overdue' for item in grouped_recalls):,}")
-    metric3.metric("Due Now", f"{sum(item['status'] == 'due_now' for item in grouped_recalls):,}")
-    metric4.metric("Unvaccinated", f"{sum(item['status'] == 'unvaccinated' for item in grouped_recalls):,}")
-    with st.expander("1. Filter Recall Recommendations", expanded=True, icon=":material/filter_list:"):
+    metric2.metric("Active Recommendations", f"{len(recalls):,}")
+    metric3.metric("Overdue", f"{sum(item['status'] == 'overdue' for item in grouped_recalls):,}")
+    metric4.metric("Due Now", f"{sum(item['status'] == 'due_now' for item in grouped_recalls):,}")
+    metric5.metric("Unvaccinated", f"{sum(item['status'] == 'unvaccinated' for item in grouped_recalls):,}")
+    with st.expander("1. Filter Recall Recommendations", expanded=False, icon=":material/filter_list:"):
         filter_col1, filter_col2, filter_col3, filter_col4, filter_col5, filter_col6 = st.columns([1.1, 1.1, 1, 1.1, 0.9, 0.8])
         all_statuses = sorted({recall["status"] for recall in grouped_recalls})
         status_filter = filter_col1.multiselect(
@@ -1082,6 +1260,7 @@ def _render_worklist_tab(
                 st.error(str(exc))
             else:
                 st.success("Recall marked complete.")
+                _invalidate_data_caches()
                 st.rerun()
         action_col1.caption("Use when this recall has been resolved and no further action is needed.")
         if action_col2.button("Suppress recall", key=f"suppress_{selected_recall['group_id']}", width="stretch", icon=":material/close:"):
@@ -1091,6 +1270,7 @@ def _render_worklist_tab(
                 st.error(str(exc))
             else:
                 st.success("Recall suppressed.")
+                _invalidate_data_caches()
                 st.rerun()
         action_col2.caption("Use when you want to remove it from the worklist without treating it as completed.")
 
@@ -1159,6 +1339,7 @@ def _render_worklist_tab(
                         st.success(
                             f"Created recall batch {batch_result['id']} with {batch_result.get('selected_count', len(selected_batch_rows))} selected patient recalls."
                         )
+                    _invalidate_data_caches()
                     st.rerun()
         else:
             st.caption("Select one or more filtered recalls to create a batch.")
@@ -1527,6 +1708,7 @@ def _render_worklist_tab(
                     st.success(
                         f"Updated batch {manual_batch_id} to {result['status']} and logged {result['logged_attempts']} recall attempt rows."
                     )
+                    _invalidate_data_caches()
                     st.rerun()
 
 
@@ -1796,6 +1978,7 @@ def _render_import_tab(
                     st.error(str(exc))
                 else:
                     st.success(f"Deleted {deleted:,} unmapped vaccination events.")
+                    _invalidate_data_caches()
                     st.rerun()
 
             if action_col2.button(
@@ -1813,7 +1996,7 @@ def _render_import_tab(
                         progress_bar.progress(min(max(progress, 0.0), 1.0))
                         progress_placeholder.info(message)
 
-                    with st.spinner("Rebuilding surgery from stored import rows..."):
+                    with st.spinner("Rebuilding surgery from stored import rows...", show_time=True):
                         try:
                             result = store.rebuild_surgery_from_batch(
                                 user_context=user_context,
@@ -1832,6 +2015,7 @@ def _render_import_tab(
                                 f"Patients: {result['patients']}, events: {result['events']}, "
                                 f"recommendations: {result['recommendations']}."
                             )
+                            _invalidate_data_caches()
                             st.rerun()
     else:
         st.caption("No import batches are visible for this surgery yet.")
@@ -2061,7 +2245,7 @@ def _render_import_tab(
             progress_bar.progress(min(max(progress, 0.0), 1.0))
             progress_placeholder.info(message)
 
-        with st.spinner("Persisting cohort to Supabase..."):
+        with st.spinner("Persisting cohort to Supabase...", show_time=True):
             try:
                 result = store.persist_processed_cohort(
                     cohort=processed,
@@ -2095,6 +2279,7 @@ def _render_import_tab(
                     f"Patients: {result['patients']}, events: {result['events']}, "
                     f"recommendations: {result['recommendations']}."
                 )
+                _invalidate_data_caches()
 
 
 def _render_settings_tab(
@@ -2249,6 +2434,25 @@ def _render_vaccination_events_tab(
             key="events_surgery_filter",
         )
 
+    refresh_col, toggle_col1, toggle_col2, _ = st.columns([0.18, 0.2, 0.24, 0.38])
+    if refresh_col.button(
+        "Refresh data",
+        key="events_refresh_data",
+        icon=":material/refresh:",
+    ):
+        _invalidate_data_caches()
+        st.rerun()
+    exclude_flu_events = toggle_col1.toggle(
+        "Exclude Flu",
+        value=True,
+        key="events_exclude_flu",
+    )
+    exclude_covid_events = toggle_col2.toggle(
+        "Exclude COVID-19",
+        value=True,
+        key="events_exclude_covid19",
+    )
+
     filter_col1, filter_col2 = st.columns([1.2, 1])
     patient_search = filter_col1.text_input(
         "Patient search",
@@ -2270,7 +2474,8 @@ def _render_vaccination_events_tab(
     )
 
     try:
-        patients = store.list_patients_with_vaccination_events(
+        patients = _get_cached_vaccination_event_patients(
+            store,
             user_context,
             surgery_id=selected_surgery_id,
             include_without_events=include_without_events,
@@ -2282,6 +2487,21 @@ def _render_vaccination_events_tab(
     if not patients:
         st.info("No patient vaccination records are visible for this account and surgery filter.")
         return
+
+    excluded_vaccines = set()
+    if exclude_flu_events:
+        excluded_vaccines.add("Flu")
+    if exclude_covid_events:
+        excluded_vaccines.add("COVID-19")
+    patients = [
+        _apply_vaccination_event_exclusions(patient, excluded_vaccines=excluded_vaccines)
+        for patient in patients
+    ]
+    if not include_without_events:
+        patients = [
+            patient for patient in patients
+            if int(patient.get("event_count") or 0) > 0
+        ]
 
     filtered_patients = [
         patient
@@ -2352,14 +2572,19 @@ def _render_vaccination_events_tab(
     )
     selected_patient = patient_map[selected_patient_id]
 
-    timeline = store.get_patient_timeline(
+    timeline = _get_cached_patient_timeline(
+        store,
         user_context=user_context,
         surgery_id=str(selected_patient.get("surgery_id") or ""),
         nhs_number=str(selected_patient.get("nhs_number") or ""),
     )
-    event_rows = timeline.get("events", [])
+    event_rows = [
+        event
+        for event in (timeline.get("events", []) or [])
+        if str(event.get("canonical_vaccine") or "") not in excluded_vaccines
+    ]
     if not event_rows:
-        st.info("No vaccination events are stored for this patient.")
+        st.info("No vaccination events are stored for this patient after the current vaccine exclusions.")
         return
 
     st.divider()
@@ -2540,7 +2765,7 @@ with st.sidebar:
             if clear_confirm.strip().upper() != str(target_surgery.get("surgery_code") or "").upper():
                 st.error("Confirmation code does not match the selected surgery code.")
             else:
-                with st.spinner("Clearing imported test data from Supabase..."):
+                with st.spinner("Clearing imported test data from Supabase...", show_time=True):
                     try:
                         counts = store.clear_import_data(
                             user_context=user_context,
@@ -2557,26 +2782,37 @@ with st.sidebar:
                             f"legacy sms batches {counts['bulk_sms_batches']}, "
                             f"import batches {counts['import_batches']}."
                         )
+                        _invalidate_data_caches()
                         st.rerun()
     else:
         st.caption("Select an existing surgery before clearing imported test data.")
 
-worklist_tab, events_tab, import_tab, settings_tab = st.tabs(
-    [":material/clinical_notes: Recall Worklist", ":material/syringe: Vaccination Events", ":material/sim_card_download: Import & Process", ":material/medical_services: Surgery Settings"]
+main_view = st.radio(
+    "Section",
+    options=[
+        ":material/clinical_notes: Recall Worklist",
+        ":material/syringe: Vaccination Events",
+        ":material/sim_card_download: Import & Process",
+        ":material/medical_services: Surgery Settings",
+    ],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="main_view",
 )
-with worklist_tab:
+
+if main_view == ":material/clinical_notes: Recall Worklist":
     _render_worklist_tab(
         store,
         user_context,
         self_book_url=self_book_url or None,
         sms_sender_id=sms_sender_id or None,
     )
-with events_tab:
+elif main_view == ":material/syringe: Vaccination Events":
     _render_vaccination_events_tab(
         store=store,
         user_context=user_context,
     )
-with import_tab:
+elif main_view == ":material/sim_card_download: Import & Process":
     _render_import_tab(
         store=store,
         user_context=user_context,
@@ -2590,7 +2826,7 @@ with import_tab:
         min_age_years=min_age_years,
         max_age_years=max_age_years,
     )
-with settings_tab:
+else:
     _render_settings_tab(
         store=store,
         user_context=user_context,

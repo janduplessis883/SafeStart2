@@ -50,6 +50,10 @@ class SupabaseStore:
     RECOMMENDATION_ROWS_CHUNK_SIZE = 250
     UPDATE_IDS_CHUNK_SIZE = 500
     BULK_SMS_BATCH_CHUNK_SIZE = 100
+    ACTIVE_RECALLS_PAGE_SIZE = 1000
+    PATIENTS_PAGE_SIZE = 1000
+    VACCINATION_EVENTS_PAGE_SIZE = 1000
+    IMPORT_BATCHES_PAGE_SIZE = 100
 
     def __init__(self, session_tokens: Optional[Dict[str, str]] = None) -> None:
         settings = get_supabase_settings()
@@ -637,15 +641,25 @@ class SupabaseStore:
         if not user_context.is_authorized:
             raise AuthorizationError("You must sign in before viewing import batches.")
 
-        query = (
-            self.client.table("import_batches")
-            .select("id,surgery_id,uploaded_by_email,source_filename,row_count,patient_count,recommendation_count,unvaccinated_count,imported_at,notes")
-            .order("imported_at", desc=True)
-            .limit(100)
-        )
-        if surgery_id:
-            query = query.eq("surgery_id", surgery_id)
-        rows = query.execute().data or []
+        rows: List[dict] = []
+        offset = 0
+        while True:
+            query = (
+                self.client.table("import_batches")
+                .select("id,surgery_id,uploaded_by_email,source_filename,row_count,patient_count,recommendation_count,unvaccinated_count,imported_at,notes")
+                .order("imported_at", desc=True)
+                .range(offset, offset + self.IMPORT_BATCHES_PAGE_SIZE - 1)
+            )
+            if surgery_id:
+                query = query.eq("surgery_id", surgery_id)
+            page = query.execute().data or []
+            if not page:
+                break
+            rows.extend(page)
+            if len(page) < self.IMPORT_BATCHES_PAGE_SIZE:
+                break
+            offset += self.IMPORT_BATCHES_PAGE_SIZE
+
         surgery_map = {
             surgery["id"]: surgery
             for surgery in self.list_accessible_surgeries(user_context)
@@ -875,18 +889,28 @@ class SupabaseStore:
         if not user_context.is_authorized:
             raise AuthorizationError("You must sign in before viewing recalls.")
 
-        query = (
-            self.client.table("v_active_recalls")
-            .select(
-                "id,surgery_id,nhs_number,full_name,date_of_birth,phone,email,"
-                "recommendation_type,vaccine_group,program_area,due_date,status,"
-                "priority,reason,explanation,updated_at"
+        rows: List[dict] = []
+        offset = 0
+        while True:
+            query = (
+                self.client.table("v_active_recalls")
+                .select(
+                    "id,surgery_id,nhs_number,full_name,date_of_birth,phone,email,"
+                    "recommendation_type,vaccine_group,program_area,due_date,status,"
+                    "priority,reason,explanation,updated_at"
+                )
+                .range(offset, offset + self.ACTIVE_RECALLS_PAGE_SIZE - 1)
             )
-            .limit(5000)
-        )
-        if surgery_id:
-            query = query.eq("surgery_id", surgery_id)
-        rows = query.execute().data or []
+            if surgery_id:
+                query = query.eq("surgery_id", surgery_id)
+            page = query.execute().data or []
+            if not page:
+                break
+            rows.extend(page)
+            if len(page) < self.ACTIVE_RECALLS_PAGE_SIZE:
+                break
+            offset += self.ACTIVE_RECALLS_PAGE_SIZE
+
         rows.sort(
             key=lambda row: (
                 int(row.get("priority") or 999),
@@ -934,15 +958,24 @@ class SupabaseStore:
         if not user_context.is_authorized:
             raise AuthorizationError("You must sign in before viewing vaccination events.")
 
-        query = (
-            self.client.table("patients")
-            .select("id,surgery_id,nhs_number,full_name,date_of_birth,phone,email,registration_date")
-            .order("full_name")
-            .limit(5000)
-        )
-        if surgery_id:
-            query = query.eq("surgery_id", surgery_id)
-        patient_rows = query.execute().data or []
+        patient_rows: List[dict] = []
+        offset = 0
+        while True:
+            query = (
+                self.client.table("patients")
+                .select("id,surgery_id,nhs_number,full_name,date_of_birth,phone,email,registration_date")
+                .order("full_name")
+                .range(offset, offset + self.PATIENTS_PAGE_SIZE - 1)
+            )
+            if surgery_id:
+                query = query.eq("surgery_id", surgery_id)
+            page = query.execute().data or []
+            if not page:
+                break
+            patient_rows.extend(page)
+            if len(page) < self.PATIENTS_PAGE_SIZE:
+                break
+            offset += self.PATIENTS_PAGE_SIZE
         if not patient_rows:
             return []
 
@@ -953,19 +986,25 @@ class SupabaseStore:
         patient_ids = [row["id"] for row in patient_rows if row.get("id")]
         event_rows: List[dict] = []
         for chunk in self._iter_chunks(patient_ids, self.UPDATE_IDS_CHUNK_SIZE):
-            event_rows.extend(
-                (
+            chunk_offset = 0
+            while True:
+                page = (
                     self.client.table("vaccination_events")
                     .select("patient_id,canonical_vaccine,event_date")
                     .neq("canonical_vaccine", "Unmapped")
                     .in_("patient_id", chunk)
                     .order("event_date", desc=True)
-                    .limit(5000)
+                    .range(chunk_offset, chunk_offset + self.VACCINATION_EVENTS_PAGE_SIZE - 1)
                     .execute()
                     .data
                     or []
                 )
-            )
+                if not page:
+                    break
+                event_rows.extend(page)
+                if len(page) < self.VACCINATION_EVENTS_PAGE_SIZE:
+                    break
+                chunk_offset += self.VACCINATION_EVENTS_PAGE_SIZE
 
         event_map: Dict[str, dict] = {}
         for event in event_rows:
@@ -978,15 +1017,22 @@ class SupabaseStore:
                     "event_count": 0,
                     "vaccines": set(),
                     "last_event_date": None,
+                    "event_vaccine_counts": {},
+                    "event_vaccine_last_dates": {},
                 },
             )
             entry["event_count"] += 1
             vaccine = str(event.get("canonical_vaccine") or "").strip()
             if vaccine:
                 entry["vaccines"].add(vaccine)
+                entry["event_vaccine_counts"][vaccine] = int(entry["event_vaccine_counts"].get(vaccine) or 0) + 1
             event_date = event.get("event_date")
             if event_date and (entry["last_event_date"] is None or str(event_date) > str(entry["last_event_date"])):
                 entry["last_event_date"] = event_date
+            if vaccine and event_date:
+                current_last_for_vaccine = entry["event_vaccine_last_dates"].get(vaccine)
+                if current_last_for_vaccine is None or str(event_date) > str(current_last_for_vaccine):
+                    entry["event_vaccine_last_dates"][vaccine] = event_date
 
         enriched_rows = []
         for row in patient_rows:
@@ -1003,6 +1049,8 @@ class SupabaseStore:
                     "vaccine_count": len(summary["vaccines"]) if summary else 0,
                     "vaccines_display": ", ".join(sorted(summary["vaccines"])) if summary else "",
                     "last_event_date": summary["last_event_date"] if summary else None,
+                    "event_vaccine_counts": dict(summary["event_vaccine_counts"]) if summary else {},
+                    "event_vaccine_last_dates": dict(summary["event_vaccine_last_dates"]) if summary else {},
                 }
             )
         return enriched_rows
