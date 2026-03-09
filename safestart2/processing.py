@@ -223,18 +223,37 @@ def _add_months(value: date, months: int) -> date:
     return value.replace(year=year, month=month, day=day)
 
 
-def _is_shingles_eligible(patient: Patient, reference_date: date, rule: Dict[str, object]) -> bool:
-    age_years = patient.age_in_years(reference_date)
-    if age_years < int(rule["age_years"]):
-        return False
-
-    max_age_years = int(rule["max_age_years"]) if rule.get("max_age_years") is not None else None
-    if max_age_years is not None and age_years > max_age_years:
-        return False
-
+def _shingles_first_dose_due_date(patient: Patient, rule: Dict[str, object]) -> date:
     first_dose_due_date = _add_years(patient.date_of_birth, int(rule["age_years"]))
     cutoff = rule.get("sixty_fifth_birthday_cutoff")
-    return not cutoff or first_dose_due_date >= cutoff
+    if cutoff and first_dose_due_date < cutoff:
+        return _add_years(patient.date_of_birth, 70)
+    return first_dose_due_date
+
+
+def _shingles_due_date(
+    patient: Patient,
+    observed: List[VaccineEvent],
+    reference_date: date,
+    rule: Dict[str, object],
+) -> Optional[date]:
+    if len(observed) >= 2:
+        return None
+
+    first_dose_due_date = _shingles_first_dose_due_date(patient, rule)
+    eightieth_birthday = _add_years(patient.date_of_birth, 80)
+    eighty_first_birthday = _add_years(patient.date_of_birth, 81)
+
+    if observed:
+        second_dose_due_date = _add_months(observed[0].event_date, 6)
+        if reference_date >= eighty_first_birthday or second_dose_due_date >= eighty_first_birthday:
+            return None
+        return second_dose_due_date
+
+    if reference_date < first_dose_due_date or reference_date >= eightieth_birthday:
+        return None
+
+    return first_dose_due_date
 
 
 def _build_unvaccinated_recommendation(patient: Patient, reference_date: date) -> Recommendation:
@@ -359,7 +378,8 @@ def _build_unvaccinated_recommendations(
                 continue
             due_date = rule["season_start"]
         elif vaccine_group == "Shingles":
-            if not _is_shingles_eligible(patient, reference_date, rule):
+            due_date = _shingles_due_date(patient, observed=[], reference_date=reference_date, rule=rule)
+            if due_date is None:
                 continue
         else:
             if age_years < int(rule["age_years"]):
@@ -498,8 +518,6 @@ def build_recommendations(
         adult_rules = adult_due_checks(reference_date)
         for vaccine_group, rule in adult_rules.items():
             observed = _events_for(patient, vaccine_group)
-            if vaccine_group == "Shingles" and len(observed) >= 2:
-                continue
 
             if vaccine_group != "Shingles":
                 if age_years < int(rule["age_years"]):
@@ -523,10 +541,9 @@ def build_recommendations(
                     continue
                 due_date = season_start
             elif vaccine_group == "Shingles":
-                if not _is_shingles_eligible(patient, reference_date, rule):
+                due_date = _shingles_due_date(patient, observed=observed, reference_date=reference_date, rule=rule)
+                if due_date is None:
                     continue
-                if len(observed) == 1:
-                    due_date = _add_months(observed[0].event_date, 6)
             elif observed:
                 continue
 

@@ -910,7 +910,7 @@ def _render_worklist_tab(
     metric3.metric("Overdue", f"{sum(item['status'] == 'overdue' for item in grouped_recalls):,}")
     metric4.metric("Due Now", f"{sum(item['status'] == 'due_now' for item in grouped_recalls):,}")
     metric5.metric("Unvaccinated", f"{sum(item['status'] == 'unvaccinated' for item in grouped_recalls):,}")
-    with st.expander("1. Filter Recall Recommendations", expanded=False, icon=":material/filter_list:"):
+    with st.expander("1. Filter Recall Recommendations", expanded=True, icon=":material/filter_list:"):
         filter_col1, filter_col2, filter_col3, filter_col4, filter_col5, filter_col6 = st.columns([1.1, 1.1, 1, 1.1, 0.9, 0.8])
         all_statuses = sorted({recall["status"] for recall in grouped_recalls})
         status_filter = filter_col1.multiselect(
