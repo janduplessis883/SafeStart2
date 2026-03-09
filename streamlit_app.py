@@ -971,7 +971,7 @@ def _render_worklist_tab(
         )
         exclude_prepared_recently = exclusion_col3.toggle(
             "Exclude **prepared** in recent activity lookback days",
-            value=True,
+            value=False,
             key="worklist_exclude_prepared_recently",
         )
         lookback_days = exclusion_col4.number_input(
@@ -1106,7 +1106,7 @@ def _render_worklist_tab(
         )
         st.dataframe(worklist_df, width="stretch", hide_index=True)
 
-        with st.expander("Filtered cohort analytics", expanded=False):
+        with st.expander("Filtered cohort analytics", expanded=False, icon=":material/chart_data:"):
             analytics_col1, analytics_col2, analytics_col3 = st.columns(3)
             status_summary_df = pd.DataFrame(
                 [
@@ -2683,6 +2683,8 @@ st.title("💉 SafeStart2")
 st.caption("Fresh Streamlit + Supabase vaccination recall system for ImmunizeMe exports")
 
 with st.sidebar:
+    with st.expander("Vaccination Schedule", expanded=False, icon=":material/syringe:"):
+        st.image("images/imms.png")
     st.header("Session")
     st.caption(f"Signed in as `{user_context.email}`")
     st.caption(f"Role: `{user_context.role}`")
@@ -2695,6 +2697,17 @@ with st.sidebar:
 
     st.divider()
     st.header("Import Settings")
+
+    reference_date = st.date_input("Reference Date", value=date.today())
+    lookahead_days = st.slider("Lookahead Days", min_value=7, max_value=90, value=30, step=1)
+    min_age_years, max_age_years = st.slider(
+        "Import age range (years)",
+        min_value=0,
+        max_value=120,
+        value=(0, 120),
+        step=1,
+    )
+    st.divider()
     is_superuser = user_context.is_superuser
     if not is_superuser:
         st.caption("Surgery settings are controlled by your `public.surgery_users` mapping.")
@@ -2725,15 +2738,7 @@ with st.sidebar:
         placeholder="https://...",
         help="Optional link included in SMS and bulk CSV exports.",
     )
-    reference_date = st.date_input("Reference Date", value=date.today())
-    lookahead_days = st.slider("Lookahead Days", min_value=7, max_value=90, value=30, step=1)
-    min_age_years, max_age_years = st.slider(
-        "Import age range (years)",
-        min_value=0,
-        max_value=120,
-        value=(0, 120),
-        step=1,
-    )
+
 
     target_surgery = None
     if user_context.is_superuser:
