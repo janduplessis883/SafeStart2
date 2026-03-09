@@ -595,12 +595,133 @@ def _parse_batch_notes(notes: Optional[str]) -> dict:
 
 
 def _format_batch_label(batch: dict, timestamp_key: str = "created_at") -> str:
+    selection_summary = batch.get("selection_summary") or {}
+    batch_title = ""
+    if isinstance(selection_summary, dict):
+        batch_title = str(selection_summary.get("batch_title") or "").strip()
     when = _format_ts(batch.get(timestamp_key))
     surgery = batch.get("surgery_code") or batch.get("surgery_name") or "Unknown surgery"
     method = batch.get("delivery_method") or "unassigned"
     status = batch.get("status") or "unknown"
     selected = batch.get("selected_count") or batch.get("ready_count") or 0
-    return f"{when} | {surgery} | {method} | {status} | {selected} selected"
+    label = f"{when} | {surgery} | {method} | {status} | {selected} selected"
+    if batch_title:
+        return f"{batch_title} | {label}"
+    return label
+
+
+@st.dialog("Delete Batch")
+def _confirm_delete_recall_batch_dialog(
+    store: SupabaseStore,
+    user_context: UserContext,
+    batch: dict,
+) -> None:
+    st.write(f"Delete batch `{_format_batch_label(batch)}`?")
+    st.caption("This removes the prepared batch record only. It does not delete patients or recall recommendations.")
+    action_col1, action_col2 = st.columns(2)
+    if action_col1.button("Delete batch", type="primary", icon=":material/delete:"):
+        try:
+            store.delete_recall_batch(user_context=user_context, batch_id=str(batch["id"]))
+        except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
+            st.error(str(exc))
+        else:
+            for key in ("deliver_recall_batch_id", "history_recall_batch_id", "manual_recall_batch_id"):
+                st.session_state.pop(key, None)
+            st.session_state["recall_batch_notice"] = f"Deleted recall batch {batch['id']}."
+            _invalidate_data_caches()
+            st.rerun()
+    if action_col2.button("Cancel", icon=":material/close:"):
+        st.rerun()
+
+
+@st.dialog("Suppress Batch Recalls")
+def _confirm_suppress_recall_batch_dialog(
+    store: SupabaseStore,
+    user_context: UserContext,
+    batch: dict,
+) -> None:
+    st.write(f"Suppress all recalls in batch `{_format_batch_label(batch)}`?")
+    st.caption(
+        "This will mark every active recall in the batch as suppressed and remove those items from the active worklist."
+    )
+    action_col1, action_col2 = st.columns(2)
+    if action_col1.button("Suppress recalls", type="primary", icon=":material/block:"):
+        try:
+            result = store.suppress_recall_batch(user_context=user_context, batch_id=str(batch["id"]))
+        except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
+            st.error(str(exc))
+        else:
+            for key in ("deliver_recall_batch_id", "history_recall_batch_id", "manual_recall_batch_id", "worklist_selected_recall"):
+                st.session_state.pop(key, None)
+            st.session_state["recall_batch_notice"] = (
+                f"Suppressed {result.get('suppressed_count', 0)} recall items from batch {batch['id']}."
+            )
+            _invalidate_data_caches()
+            st.rerun()
+    if action_col2.button("Cancel", icon=":material/close:"):
+        st.rerun()
+
+
+@st.dialog("Clear Imported Test Data")
+def _confirm_clear_import_data_dialog(
+    store: SupabaseStore,
+    user_context: UserContext,
+    target_surgery: dict,
+) -> None:
+    surgery_code = str(target_surgery.get("surgery_code") or "").strip()
+    st.write(f"Clear imported test data for surgery `{surgery_code}`?")
+    st.caption("This action only clears data for the selected surgery.")
+    st.markdown(
+        "\n".join(
+            [
+                "**Affected tables**",
+                "- `recall_attempts`",
+                "- `bulk_sms_batches`",
+                "- `recall_batches`",
+                "- `recall_recommendations`",
+                "- `vaccination_events`",
+                "- `import_rows`",
+                "- `import_batches`",
+                "- `patients`",
+                "",
+                "**Not affected**",
+                "- `surgeries` and surgery metadata",
+                "- user access mappings such as `surgery_users`",
+                "- vaccine alias overrides",
+                "- data for other surgeries",
+            ]
+        )
+    )
+    confirm_code = st.text_input(
+        "Type surgery code to confirm",
+        key="clear_import_data_dialog_confirm",
+        placeholder=surgery_code,
+    )
+    action_col1, action_col2 = st.columns([2,1])
+    if action_col1.button("Clear imported test data", type="primary", icon=":material/delete_forever:"):
+        if confirm_code.strip().upper() != surgery_code.upper():
+            st.error("Confirmation code does not match the selected surgery code.")
+            return
+        with st.spinner("Clearing imported test data from Supabase...", show_time=True):
+            try:
+                counts = store.clear_import_data(
+                    user_context=user_context,
+                    surgery_id=str(target_surgery["id"]),
+                )
+            except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.session_state["import_clear_notice"] = (
+                    "Cleared imported data: "
+                    f"patients {counts['patients']}, import rows {counts['import_rows']}, "
+                    f"events {counts['vaccination_events']}, recalls {counts['recall_recommendations']}, "
+                    f"attempts {counts['recall_attempts']}, recall batches {counts['recall_batches']}, "
+                    f"legacy sms batches {counts['bulk_sms_batches']}, import batches {counts['import_batches']}."
+                )
+                _invalidate_data_caches()
+                st.rerun()
+    if action_col2.button("Cancel", icon=":material/close:"):
+        st.rerun()
 
 
 def _mask_secret(value: Optional[str]) -> str:
@@ -820,8 +941,11 @@ def _render_worklist_tab(
 ) -> None:
     smsworks_settings = get_smsworks_settings()
     resend_settings = get_resend_settings()
+    batch_notice = st.session_state.pop("recall_batch_notice", None)
     st.subheader("Recall Worklist")
     st.caption("Review active recalls, log outreach attempts, and close completed or suppressed items.")
+    if batch_notice:
+        st.success(batch_notice)
 
     try:
         surgeries = store.list_accessible_surgeries(user_context)
@@ -1301,11 +1425,17 @@ def _render_worklist_tab(
                 hide_index=True,
             )
             with st.form("create_recall_batch"):
+                batch_title = st.text_input(
+                    "Batch title",
+                    placeholder="e.g. March shingles catch-up",
+                    help="Optional. Prepended to the generated batch label so it is easier to find later.",
+                )
                 batch_staff = st.text_input("Prepared by", value=user_context.full_name or user_context.email)
                 create_batch = st.form_submit_button("Create recall batch", type="primary", icon=":material/batch_prediction:")
 
             if create_batch:
                 try:
+                    normalized_batch_title = str(batch_title or "").strip()
                     selected_surgery_ids = {
                         recall_map[group_id].get("surgery_id")
                         for group_id in batch_group_ids
@@ -1319,6 +1449,7 @@ def _render_worklist_tab(
                         prepared_by_name=batch_staff,
                         selected_rows=selected_batch_rows,
                         selection_summary={
+                            "batch_title": normalized_batch_title,
                             "statuses": status_filter,
                             "workflow_filter": workflow_filter,
                             "vaccine_filter": vaccine_filter,
@@ -1601,6 +1732,7 @@ def _render_worklist_tab(
             history_df = pd.DataFrame(
                 [
                     {
+                        "Batch": str((batch.get("selection_summary") or {}).get("batch_title") or "").strip() or "—",
                         "Prepared At": _format_ts(batch.get("created_at")),
                         "Surgery": batch.get("surgery_code") or "—",
                         "Prepared By": batch.get("prepared_by_name") or batch.get("prepared_by_email") or "—",
@@ -1656,13 +1788,20 @@ def _render_worklist_tab(
                         key=f"history_batch_sms_accurx_{history_batch_id}",
                     )
                 if history_method in {"", "email"} and history_email_rows:
-                    download_col2.download_button(
-                        "Download Accurx Self-book Links CSV",
-                        data=_build_accurx_email_df(history_email_rows).to_csv(index=False),
-                        file_name=f"safestart2_accurx_email_batch_{history_batch_id}.csv",
-                        mime="text/csv",
-                        key=f"history_batch_email_accurx_{history_batch_id}",
-                    )
+                    download_col2.caption("Self-book CSV is already available via the Accurx CSV download.")
+            history_action_col1, history_action_col2, _ = st.columns([1, 1, 2])
+            if history_action_col1.button(
+                "Suppress recall",
+                key=f"suppress_recall_batch_{history_batch_id}",
+                icon=":material/block:",
+            ):
+                _confirm_suppress_recall_batch_dialog(store, user_context, history_batch)
+            if history_action_col2.button(
+                "Delete batch",
+                key=f"delete_recall_batch_{history_batch_id}",
+                icon=":material/delete:",
+            ):
+                _confirm_delete_recall_batch_dialog(store, user_context, history_batch)
             with st.expander("Batch filter snapshot", expanded=False):
                 st.json(history_batch.get("selection_summary") or {})
 
@@ -2453,7 +2592,7 @@ def _render_vaccination_events_tab(
         key="events_exclude_covid19",
     )
 
-    filter_col1, filter_col2 = st.columns([1.2, 1])
+    filter_col1, filter_col2 = st.columns([1, 2])
     patient_search = filter_col1.text_input(
         "Patient search",
         placeholder="Name, NHS, phone, vaccine",
@@ -2683,8 +2822,11 @@ st.title("💉 SafeStart2")
 st.caption("Fresh Streamlit + Supabase vaccination recall system for ImmunizeMe exports")
 
 with st.sidebar:
-    with st.expander("Vaccination Schedule", expanded=False, icon=":material/syringe:"):
+    with st.expander("Child Schedule", expanded=False, icon=":material/syringe:"):
         st.image("images/imms.png")
+    with st.expander("Adult Schedule", expanded=False, icon=":material/syringe:"):
+        st.image("images/imms2.png")
+
     st.header("Session")
     st.caption(f"Signed in as `{user_context.email}`")
     st.caption(f"Role: `{user_context.role}`")
@@ -2753,42 +2895,19 @@ with st.sidebar:
     st.divider()
     st.header("Danger Zone")
     if target_surgery and target_surgery.get("id"):
+        import_clear_notice = st.session_state.pop("import_clear_notice", None)
+        if import_clear_notice:
+            st.success(import_clear_notice)
         st.caption(
             f"Clear imported data for `{target_surgery.get('surgery_code')}` only. "
             "This keeps surgeries and user access records."
-        )
-        clear_confirm = st.text_input(
-            "Type surgery code to confirm",
-            key="clear_import_data_confirm",
-            placeholder=target_surgery.get("surgery_code") or "",
         )
         if st.button(
             "Clear imported test data",
             key="clear_import_data_button",
             width="stretch",
         ):
-            if clear_confirm.strip().upper() != str(target_surgery.get("surgery_code") or "").upper():
-                st.error("Confirmation code does not match the selected surgery code.")
-            else:
-                with st.spinner("Clearing imported test data from Supabase...", show_time=True):
-                    try:
-                        counts = store.clear_import_data(
-                            user_context=user_context,
-                            surgery_id=str(target_surgery["id"]),
-                        )
-                    except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
-                        st.error(str(exc))
-                    else:
-                        st.success(
-                            "Cleared imported data: "
-                            f"patients {counts['patients']}, import rows {counts['import_rows']}, "
-                            f"events {counts['vaccination_events']}, recalls {counts['recall_recommendations']}, "
-                            f"attempts {counts['recall_attempts']}, recall batches {counts['recall_batches']}, "
-                            f"legacy sms batches {counts['bulk_sms_batches']}, "
-                            f"import batches {counts['import_batches']}."
-                        )
-                        _invalidate_data_caches()
-                        st.rerun()
+            _confirm_clear_import_data_dialog(store, user_context, target_surgery)
     else:
         st.caption("Select an existing surgery before clearing imported test data.")
 

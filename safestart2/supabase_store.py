@@ -1513,6 +1513,66 @@ class SupabaseStore:
             raise AuthorizationError("That recall batch could not be found or is not visible.")
         return updated.data[0]
 
+    def delete_recall_batch(
+        self,
+        user_context: UserContext,
+        batch_id: str,
+    ) -> dict:
+        if not self.client:
+            raise RuntimeError("Supabase is not configured.")
+        if not user_context.is_authorized:
+            raise AuthorizationError("You must sign in before deleting recall batches.")
+
+        deleted = (
+            self.client.table("recall_batches")
+            .delete(returning="representation")
+            .eq("id", batch_id)
+            .execute()
+        )
+        if not deleted.data:
+            raise AuthorizationError("That recall batch could not be found or is not visible.")
+        return deleted.data[0]
+
+    def suppress_recall_batch(
+        self,
+        user_context: UserContext,
+        batch_id: str,
+    ) -> dict:
+        if not self.client:
+            raise RuntimeError("Supabase is not configured.")
+        if not user_context.is_authorized:
+            raise AuthorizationError("You must sign in before suppressing recall batches.")
+
+        batch = self._get_recall_batch(batch_id)
+        if not batch:
+            raise AuthorizationError("That recall batch could not be found or is not visible.")
+
+        export_rows = batch.get("export_rows") or []
+        recommendation_ids: List[str] = []
+        for row in export_rows:
+            for recommendation_id in list(row.get("Recommendation IDs") or []):
+                normalized_id = str(recommendation_id or "").strip()
+                if normalized_id:
+                    recommendation_ids.append(normalized_id)
+        unique_recommendation_ids = list(dict.fromkeys(recommendation_ids))
+        if not unique_recommendation_ids:
+            raise ValueError("This recall batch does not contain any recall recommendations to suppress.")
+
+        suppressed_count = self.close_recall_group(
+            user_context=user_context,
+            recommendation_ids=unique_recommendation_ids,
+            status="suppressed",
+        )
+        updated_batch = self.set_recall_batch_status(
+            user_context=user_context,
+            batch_id=batch_id,
+            status="suppressed",
+        )
+        return {
+            **updated_batch,
+            "suppressed_count": suppressed_count,
+        }
+
     def log_recall_batch_outcome(
         self,
         user_context: UserContext,
