@@ -610,6 +610,66 @@ def _format_batch_label(batch: dict, timestamp_key: str = "created_at") -> str:
     return label
 
 
+def _delete_recall_batch(store: SupabaseStore, user_context: UserContext, batch_id: str) -> dict:
+    delete_method = getattr(store, "delete_recall_batch", None)
+    if callable(delete_method):
+        return delete_method(user_context=user_context, batch_id=batch_id)
+
+    if not store.client:
+        raise RuntimeError("Supabase is not configured.")
+    if not user_context.is_authorized:
+        raise AuthorizationError("You must sign in before deleting recall batches.")
+
+    deleted = (
+        store.client.table("recall_batches")
+        .delete(returning="representation")
+        .eq("id", batch_id)
+        .execute()
+    )
+    if not deleted.data:
+        raise AuthorizationError("That recall batch could not be found or is not visible.")
+    return deleted.data[0]
+
+
+def _suppress_recall_batch(store: SupabaseStore, user_context: UserContext, batch_id: str) -> dict:
+    suppress_method = getattr(store, "suppress_recall_batch", None)
+    if callable(suppress_method):
+        return suppress_method(user_context=user_context, batch_id=batch_id)
+
+    batch_getter = getattr(store, "_get_recall_batch", None)
+    if not callable(batch_getter):
+        raise RuntimeError("This deployment does not expose batch suppression support.")
+
+    batch = batch_getter(batch_id)
+    if not batch:
+        raise AuthorizationError("That recall batch could not be found or is not visible.")
+
+    recommendation_ids: list[str] = []
+    for row in batch.get("export_rows") or []:
+        for recommendation_id in list(row.get("Recommendation IDs") or []):
+            normalized_id = str(recommendation_id or "").strip()
+            if normalized_id:
+                recommendation_ids.append(normalized_id)
+    unique_recommendation_ids = list(dict.fromkeys(recommendation_ids))
+    if not unique_recommendation_ids:
+        raise ValueError("This recall batch does not contain any recall recommendations to suppress.")
+
+    suppressed_count = store.close_recall_group(
+        user_context=user_context,
+        recommendation_ids=unique_recommendation_ids,
+        status="suppressed",
+    )
+    updated_batch = store.set_recall_batch_status(
+        user_context=user_context,
+        batch_id=batch_id,
+        status="suppressed",
+    )
+    return {
+        **updated_batch,
+        "suppressed_count": suppressed_count,
+    }
+
+
 @st.dialog("Delete Batch")
 def _confirm_delete_recall_batch_dialog(
     store: SupabaseStore,
@@ -621,7 +681,7 @@ def _confirm_delete_recall_batch_dialog(
     action_col1, action_col2 = st.columns(2)
     if action_col1.button("Delete batch", type="primary", icon=":material/delete:"):
         try:
-            store.delete_recall_batch(user_context=user_context, batch_id=str(batch["id"]))
+            _delete_recall_batch(store, user_context, str(batch["id"]))
         except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
             st.error(str(exc))
         else:
@@ -647,7 +707,7 @@ def _confirm_suppress_recall_batch_dialog(
     action_col1, action_col2 = st.columns(2)
     if action_col1.button("Suppress recalls", type="primary", icon=":material/block:"):
         try:
-            result = store.suppress_recall_batch(user_context=user_context, batch_id=str(batch["id"]))
+            result = _suppress_recall_batch(store, user_context, str(batch["id"]))
         except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
             st.error(str(exc))
         else:
