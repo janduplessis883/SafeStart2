@@ -48,12 +48,12 @@ class ProcessImmunizeMeRowsTests(unittest.TestCase):
                 "last_name": "Example",
                 "nhs_number": "7000000001",
                 "sex": "F",
-                "date_of_birth": "1950-01-10",
+                "date_of_birth": "1959-01-10",
                 "registration_date": "2000-01-01",
                 "raw_vaccine_name": "Shingles",
                 "phone": "07486321744",
                 "email": "nicoletta@example.com",
-                "event_date": "2024-09-15",
+                "event_date": "2025-09-15",
                 "event_done_at_id": "evt-1",
             }
         ]
@@ -67,9 +67,9 @@ class ProcessImmunizeMeRowsTests(unittest.TestCase):
 
         shingles_recalls = [item for item in cohort.recommendations if item.vaccine_group == "Shingles"]
         self.assertEqual(len(shingles_recalls), 1)
-        self.assertEqual(shingles_recalls[0].due_date, date(2025, 3, 15))
+        self.assertEqual(shingles_recalls[0].due_date, date(2026, 3, 15))
 
-    def test_unvaccinated_ages_65_to_79_include_shingles_in_pathway(self) -> None:
+    def test_unvaccinated_patients_become_shingles_eligible_at_cutoff(self) -> None:
         rows = [
             {
                 "source_patient_id": "1",
@@ -77,7 +77,7 @@ class ProcessImmunizeMeRowsTests(unittest.TestCase):
                 "last_name": "Eligible",
                 "nhs_number": "7000000003",
                 "sex": "F",
-                "date_of_birth": "1950-01-10",
+                "date_of_birth": "1958-09-01",
                 "registration_date": "2000-01-01",
                 "raw_vaccine_name": "Unknown",
                 "phone": "07486321744",
@@ -100,6 +100,62 @@ class ProcessImmunizeMeRowsTests(unittest.TestCase):
         self.assertIn("Shingles", vaccines)
         self.assertIn("Flu", vaccines)
         self.assertEqual(statuses, {"unvaccinated"})
+
+    def test_unvaccinated_patients_with_pre_cutoff_shingles_due_date_are_not_eligible(self) -> None:
+        rows = [
+            {
+                "source_patient_id": "1",
+                "first_name": "PreCutoff",
+                "last_name": "Patient",
+                "nhs_number": "7000000004",
+                "sex": "F",
+                "date_of_birth": "1950-01-10",
+                "registration_date": "2000-01-01",
+                "raw_vaccine_name": "Unknown",
+                "phone": "07486321744",
+                "email": "precutoff@example.com",
+                "event_date": None,
+                "event_done_at_id": "evt-4",
+            }
+        ]
+
+        cohort = process_immunizeme_rows(
+            rows,
+            reference_date=date(2026, 3, 8),
+            lookahead_days=30,
+            overrides=None,
+        )
+
+        vaccines = {item.vaccine_group for item in cohort.recommendations}
+        self.assertNotIn("Shingles", vaccines)
+
+    def test_shingles_second_dose_is_not_recalled_for_pre_cutoff_first_dose_cohorts(self) -> None:
+        rows = [
+            {
+                "source_patient_id": "1",
+                "first_name": "Older",
+                "last_name": "Patient",
+                "nhs_number": "7000000005",
+                "sex": "F",
+                "date_of_birth": "1950-01-10",
+                "registration_date": "2000-01-01",
+                "raw_vaccine_name": "Shingles",
+                "phone": "07486321744",
+                "email": "older@example.com",
+                "event_date": "2024-09-15",
+                "event_done_at_id": "evt-5",
+            }
+        ]
+
+        cohort = process_immunizeme_rows(
+            rows,
+            reference_date=date(2026, 3, 8),
+            lookahead_days=30,
+            overrides=None,
+        )
+
+        shingles_recalls = [item for item in cohort.recommendations if item.vaccine_group == "Shingles"]
+        self.assertEqual(shingles_recalls, [])
 
     def test_build_patients_from_rows_treats_nat_event_date_as_missing(self) -> None:
         patients, warnings, mapped_rows = build_patients_from_rows(

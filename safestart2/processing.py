@@ -223,6 +223,20 @@ def _add_months(value: date, months: int) -> date:
     return value.replace(year=year, month=month, day=day)
 
 
+def _is_shingles_eligible(patient: Patient, reference_date: date, rule: Dict[str, object]) -> bool:
+    age_years = patient.age_in_years(reference_date)
+    if age_years < int(rule["age_years"]):
+        return False
+
+    max_age_years = int(rule["max_age_years"]) if rule.get("max_age_years") is not None else None
+    if max_age_years is not None and age_years > max_age_years:
+        return False
+
+    first_dose_due_date = _add_years(patient.date_of_birth, int(rule["age_years"]))
+    cutoff = rule.get("sixty_fifth_birthday_cutoff")
+    return not cutoff or first_dose_due_date >= cutoff
+
+
 def _build_unvaccinated_recommendation(patient: Patient, reference_date: date) -> Recommendation:
     age_years = patient.age_in_days(reference_date) // 365
     if age_years < 1:
@@ -345,16 +359,7 @@ def _build_unvaccinated_recommendations(
                 continue
             due_date = rule["season_start"]
         elif vaccine_group == "Shingles":
-            if age_years < int(rule["age_years"]):
-                continue
-            max_age_years = int(rule["max_age_years"]) if rule.get("max_age_years") is not None else None
-            if max_age_years is not None and age_years > max_age_years:
-                continue
-            age_65_date = _add_years(patient.date_of_birth, 65)
-            cutoff = rule.get("sixty_fifth_birthday_cutoff")
-            is_catch_up_age = 70 <= age_years <= int(rule["max_age_years"])
-            is_post_cutoff_65 = bool(cutoff and age_65_date >= cutoff)
-            if not (is_catch_up_age or is_post_cutoff_65):
+            if not _is_shingles_eligible(patient, reference_date, rule):
                 continue
         else:
             if age_years < int(rule["age_years"]):
@@ -518,20 +523,10 @@ def build_recommendations(
                     continue
                 due_date = season_start
             elif vaccine_group == "Shingles":
+                if not _is_shingles_eligible(patient, reference_date, rule):
+                    continue
                 if len(observed) == 1:
                     due_date = _add_months(observed[0].event_date, 6)
-                else:
-                    if age_years < int(rule["age_years"]):
-                        continue
-                    max_age_years = int(rule["max_age_years"]) if rule.get("max_age_years") is not None else None
-                    if max_age_years is not None and age_years > max_age_years:
-                        continue
-                    age_65_date = _add_years(patient.date_of_birth, 65)
-                    cutoff = rule.get("sixty_fifth_birthday_cutoff")
-                    is_catch_up_age = 70 <= age_years <= int(rule["max_age_years"])
-                    is_post_cutoff_65 = bool(cutoff and age_65_date >= cutoff)
-                    if not (is_catch_up_age or is_post_cutoff_65):
-                        continue
             elif observed:
                 continue
 
