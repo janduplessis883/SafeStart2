@@ -368,7 +368,7 @@ def _build_accurx_sms_df(rows: list[dict]) -> pd.DataFrame:
         [
             {
                 "NHS number": row.get("NHS Number") or "—",
-                "Telephone number": row.get("Phone") or "—",
+                "Telecom number": row.get("Phone") or "—",
                 "DOB": row.get("DOB") or "—",
                 "Firstname": row.get("Firstname") or "—",
             }
@@ -382,7 +382,7 @@ def _build_accurx_email_df(rows: list[dict]) -> pd.DataFrame:
         [
             {
                 "NHS number": row.get("NHS Number") or "—",
-                "Phone": row.get("Phone") or "—",
+                "Telecom number": row.get("Phone") or "—",
                 "DOB": row.get("DOB") or "—",
                 "Firstname": row.get("Firstname") or "—",
             }
