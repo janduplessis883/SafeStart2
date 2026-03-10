@@ -13,7 +13,8 @@ from supabase_auth.errors import AuthApiError
 
 from .config import get_supabase_settings
 from .models import ProcessedCohort
-from .processing import process_immunizeme_dataframe, process_immunizeme_rows
+from .processing import classify_due_status, process_immunizeme_dataframe, process_immunizeme_rows
+from .schedule import current_covid_season_start, current_flu_season_start
 from .workflow import compare_processed_cohorts
 
 
@@ -1720,6 +1721,160 @@ class SupabaseStore:
             counts[table_name] = self._delete_for_surgery(table_name, surgery_id)
 
         return counts
+
+    def _run_season_rollover(
+        self,
+        *,
+        user_context: UserContext,
+        surgery_id: str,
+        reference_date: date,
+        vaccine_group: str,
+        program_areas: List[str],
+        target_due_date: date,
+        action_label: str,
+    ) -> Dict[str, object]:
+        if not self.client:
+            raise RuntimeError("Supabase is not configured.")
+        if not user_context.is_authorized:
+            raise AuthorizationError(f"You must sign in before running a {action_label}.")
+        if not surgery_id:
+            raise ValueError(f"A surgery must be selected before running a {action_label}.")
+
+        target_due_date_str = target_due_date.isoformat()
+        target_status, _ = classify_due_status(target_due_date, reference_date)
+
+        rows: List[dict] = []
+        offset = 0
+        while True:
+            page = (
+                self.client.table("recall_recommendations")
+                .select("id,patient_id,due_date,status,updated_at")
+                .eq("surgery_id", surgery_id)
+                .eq("is_active", True)
+                .eq("vaccine_group", vaccine_group)
+                .eq("recommendation_type", "seasonal")
+                .in_("program_area", program_areas)
+                .range(offset, offset + self.UPDATE_IDS_CHUNK_SIZE - 1)
+                .execute()
+                .data
+                or []
+            )
+            if not page:
+                break
+            rows.extend(page)
+            if len(page) < self.UPDATE_IDS_CHUNK_SIZE:
+                break
+            offset += self.UPDATE_IDS_CHUNK_SIZE
+
+        if not rows:
+            return {
+                "target_due_date": target_due_date_str,
+                "target_status": target_status,
+                "examined_count": 0,
+                "updated_count": 0,
+                "deactivated_count": 0,
+            }
+
+        grouped_rows: Dict[str, List[dict]] = {}
+        for row in rows:
+            patient_id = str(row.get("patient_id") or "")
+            if not patient_id:
+                continue
+            grouped_rows.setdefault(patient_id, []).append(row)
+
+        update_ids: List[str] = []
+        deactivate_ids: List[str] = []
+
+        for patient_rows in grouped_rows.values():
+            ordered_rows = sorted(
+                patient_rows,
+                key=lambda row: (
+                    str(row.get("due_date") or ""),
+                    str(row.get("updated_at") or ""),
+                    str(row.get("id") or ""),
+                ),
+                reverse=True,
+            )
+            target_rows = [row for row in ordered_rows if str(row.get("due_date") or "") == target_due_date_str]
+
+            if target_rows:
+                keep_row = target_rows[0]
+                if str(keep_row.get("status") or "") != target_status:
+                    keep_id = str(keep_row.get("id") or "").strip()
+                    if keep_id:
+                        update_ids.append(keep_id)
+                rows_to_deactivate = [row for row in ordered_rows if row is not keep_row]
+            else:
+                keep_row = ordered_rows[0]
+                keep_id = str(keep_row.get("id") or "").strip()
+                if keep_id and (
+                    str(keep_row.get("due_date") or "") != target_due_date_str
+                    or str(keep_row.get("status") or "") != target_status
+                ):
+                    update_ids.append(keep_id)
+                rows_to_deactivate = ordered_rows[1:]
+
+            for row in rows_to_deactivate:
+                row_id = str(row.get("id") or "").strip()
+                if row_id:
+                    deactivate_ids.append(row_id)
+
+        unique_update_ids = list(dict.fromkeys(update_ids))
+        unique_deactivate_ids = list(dict.fromkeys(deactivate_ids))
+
+        for chunk in self._iter_chunks(unique_update_ids, self.UPDATE_IDS_CHUNK_SIZE):
+            self.client.table("recall_recommendations").update(
+                {"due_date": target_due_date_str, "status": target_status},
+                returning="minimal",
+            ).in_("id", chunk).execute()
+
+        for chunk in self._iter_chunks(unique_deactivate_ids, self.UPDATE_IDS_CHUNK_SIZE):
+            self.client.table("recall_recommendations").update(
+                {"is_active": False},
+                returning="minimal",
+            ).in_("id", chunk).execute()
+
+        return {
+            "target_due_date": target_due_date_str,
+            "target_status": target_status,
+            "examined_count": len(rows),
+            "updated_count": len(unique_update_ids),
+            "deactivated_count": len(unique_deactivate_ids),
+        }
+
+    def run_flu_season_rollover(
+        self,
+        user_context: UserContext,
+        surgery_id: str,
+        reference_date: Optional[date] = None,
+    ) -> Dict[str, object]:
+        reference_date = reference_date or date.today()
+        return self._run_season_rollover(
+            user_context=user_context,
+            surgery_id=surgery_id,
+            reference_date=reference_date,
+            vaccine_group="Flu",
+            program_areas=["seasonal_adult", "seasonal_child"],
+            target_due_date=current_flu_season_start(reference_date),
+            action_label="flu season rollover",
+        )
+
+    def run_covid_season_rollover(
+        self,
+        user_context: UserContext,
+        surgery_id: str,
+        reference_date: Optional[date] = None,
+    ) -> Dict[str, object]:
+        reference_date = reference_date or date.today()
+        return self._run_season_rollover(
+            user_context=user_context,
+            surgery_id=surgery_id,
+            reference_date=reference_date,
+            vaccine_group="COVID-19",
+            program_areas=["seasonal_adult"],
+            target_due_date=current_covid_season_start(reference_date),
+            action_label="COVID-19 season rollover",
+        )
 
     def count_unmapped_vaccination_events(
         self,

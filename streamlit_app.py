@@ -19,7 +19,7 @@ from safestart2.messaging import build_email_message, build_outreach_message, fi
 from safestart2.parser import load_dataframe, sanitize_dataframe_columns
 from safestart2.processing import INPUT_COLUMNS, process_immunizeme_dataframe
 from safestart2.resend_client import build_resend_requests, send_resend_requests
-from safestart2.schedule import get_child_rules_for_patient
+from safestart2.schedule import current_covid_season_start, current_flu_season_start, get_child_rules_for_patient
 from safestart2.smsworks import build_smsworks_dry_run_payload, send_smsworks_requests
 from safestart2.supabase_store import (
     AuthenticationError,
@@ -780,6 +780,112 @@ def _confirm_clear_import_data_dialog(
                 )
                 _invalidate_data_caches()
                 st.rerun()
+    if action_col2.button("Cancel", icon=":material/close:"):
+        st.rerun()
+
+
+@st.dialog("Run Flu Season Rollover")
+def _confirm_flu_season_rollover_dialog(
+    store: SupabaseStore,
+    user_context: UserContext,
+    target_surgery: dict,
+    reference_date: date,
+) -> None:
+    surgery_code = str(target_surgery.get("surgery_code") or "").strip()
+    target_due_date = current_flu_season_start(reference_date)
+    st.write(f"Run flu season rollover for surgery `{surgery_code}`?")
+    st.caption(
+        f"This will align active seasonal Flu recalls for this surgery to target season date `{target_due_date.isoformat()}` "
+        f"using reference date `{reference_date.isoformat()}`."
+    )
+    st.markdown(
+        "\n".join(
+            [
+                "**This will**",
+                "- update active seasonal Flu recall due dates to the target season date",
+                "- recalculate Flu recall statuses for that target date",
+                "- deactivate duplicate stale active Flu recalls when a target-season row already exists",
+                "",
+                "**This will not**",
+                "- re-import source files",
+                "- change `patients`, `vaccination_events`, `import_rows`, or `import_batches`",
+                "- rewrite prepared batch snapshots already stored in `recall_batches`",
+                "- change data for other surgeries",
+            ]
+        )
+    )
+    action_col1, action_col2 = st.columns(2)
+    if action_col1.button("Continue", type="primary", icon=":material/autorenew:"):
+        try:
+            result = store.run_flu_season_rollover(
+                user_context=user_context,
+                surgery_id=str(target_surgery["id"]),
+                reference_date=reference_date,
+            )
+        except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["flu_rollover_notice"] = (
+                f"Flu rollover complete for {surgery_code}: "
+                f"{result.get('updated_count', 0)} rows updated, "
+                f"{result.get('deactivated_count', 0)} duplicates deactivated, "
+                f"target due date {result.get('target_due_date')}."
+            )
+            _invalidate_data_caches()
+            st.rerun()
+    if action_col2.button("Cancel", icon=":material/close:"):
+        st.rerun()
+
+
+@st.dialog("Run COVID-19 Season Rollover")
+def _confirm_covid_season_rollover_dialog(
+    store: SupabaseStore,
+    user_context: UserContext,
+    target_surgery: dict,
+    reference_date: date,
+) -> None:
+    surgery_code = str(target_surgery.get("surgery_code") or "").strip()
+    target_due_date = current_covid_season_start(reference_date)
+    st.write(f"Run COVID-19 season rollover for surgery `{surgery_code}`?")
+    st.caption(
+        f"This will align active seasonal COVID-19 recalls for this surgery to target campaign date `{target_due_date.isoformat()}` "
+        f"using reference date `{reference_date.isoformat()}`."
+    )
+    st.markdown(
+        "\n".join(
+            [
+                "**This will**",
+                "- update active seasonal COVID-19 recall due dates to the next applicable campaign start",
+                "- recalculate COVID-19 recall statuses for that target date",
+                "- deactivate duplicate stale active COVID-19 recalls when a target-campaign row already exists",
+                "",
+                "**This will not**",
+                "- re-import source files",
+                "- change `patients`, `vaccination_events`, `import_rows`, or `import_batches`",
+                "- rewrite prepared batch snapshots already stored in `recall_batches`",
+                "- change data for other surgeries",
+            ]
+        )
+    )
+    action_col1, action_col2 = st.columns([2, 1])
+    if action_col1.button("Continue", type="primary", icon=":material/autorenew:"):
+        try:
+            result = store.run_covid_season_rollover(
+                user_context=user_context,
+                surgery_id=str(target_surgery["id"]),
+                reference_date=reference_date,
+            )
+        except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["covid_rollover_notice"] = (
+                f"COVID-19 rollover complete for {surgery_code}: "
+                f"{result.get('updated_count', 0)} rows updated, "
+                f"{result.get('deactivated_count', 0)} duplicates deactivated, "
+                f"target due date {result.get('target_due_date')}."
+            )
+            _invalidate_data_caches()
+            st.rerun()
     if action_col2.button("Cancel", icon=":material/close:"):
         st.rerun()
 
@@ -2956,12 +3062,40 @@ with st.sidebar:
     st.header("Danger Zone")
     if target_surgery and target_surgery.get("id"):
         import_clear_notice = st.session_state.pop("import_clear_notice", None)
+        flu_rollover_notice = st.session_state.pop("flu_rollover_notice", None)
+        covid_rollover_notice = st.session_state.pop("covid_rollover_notice", None)
         if import_clear_notice:
             st.success(import_clear_notice)
+        if flu_rollover_notice:
+            st.success(flu_rollover_notice)
+        if covid_rollover_notice:
+            st.success(covid_rollover_notice)
         st.caption(
             f"Clear imported data for `{target_surgery.get('surgery_code')}` only. "
             "This keeps surgeries and user access records."
         )
+        if st.button(
+            "Run flu season rollover",
+            key="run_flu_season_rollover_button",
+            width="stretch",
+        ):
+            _confirm_flu_season_rollover_dialog(
+                store,
+                user_context,
+                target_surgery,
+                reference_date=reference_date,
+            )
+        if st.button(
+            "Run COVID-19 season rollover",
+            key="run_covid_season_rollover_button",
+            width="stretch",
+        ):
+            _confirm_covid_season_rollover_dialog(
+                store,
+                user_context,
+                target_surgery,
+                reference_date=reference_date,
+            )
         if st.button(
             "Clear imported test data",
             key="clear_import_data_button",

@@ -64,13 +64,26 @@ def get_child_rules_for_patient(dob: date) -> List[SeriesRule]:
 def current_flu_season_start(reference_date: date) -> date:
     if reference_date.month >= 9:
         return date(reference_date.year, 9, 1)
-    return date(reference_date.year - 1, 9, 1)
+    if reference_date.month == 1:
+        return date(reference_date.year - 1, 9, 1)
+    return date(reference_date.year, 9, 1)
 
 
 def current_covid_season_start(reference_date: date) -> date:
-    if reference_date.month >= 9:
-        return date(reference_date.year, 9, 1)
-    return date(reference_date.year, 1, 1)
+    spring_start = date(reference_date.year, 4, 13)
+    spring_end = date(reference_date.year, 6, 30)
+    autumn_start = date(reference_date.year, 10, 1)
+    autumn_end = date(reference_date.year, 12, 19)
+
+    if reference_date < spring_start:
+        return spring_start
+    if reference_date <= spring_end:
+        return spring_start
+    if reference_date < autumn_start:
+        return autumn_start
+    if reference_date <= autumn_end:
+        return autumn_start
+    return date(reference_date.year + 1, 4, 13)
 
 
 def child_seasonal_due_checks(reference_date: date) -> Dict[str, Dict[str, object]]:

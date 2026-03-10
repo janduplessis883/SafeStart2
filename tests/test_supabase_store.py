@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import date
 
 from safestart2.supabase_store import SupabaseStore, UserContext
 
@@ -27,6 +28,7 @@ class _FakeQuery:
         self._end = len(rows) - 1
         self._filters: dict[str, object] = {}
         self._neq_filters: dict[str, object] = {}
+        self._update_payload: dict[str, object] | None = None
 
     def select(self, _fields: str):
         return self
@@ -52,6 +54,10 @@ class _FakeQuery:
             self._event_patient_chunks.append(values_tuple)
         return self
 
+    def update(self, payload: dict[str, object], returning: str | None = None):
+        self._update_payload = dict(payload)
+        return self
+
     def execute(self):
         filtered = [
             row for row in self._rows
@@ -65,6 +71,12 @@ class _FakeQuery:
             )
             and all(row.get(field) != value for field, value in self._neq_filters.items())
         ]
+        if self._update_payload is not None:
+            updated_rows = []
+            for row in filtered[self._start:self._end + 1]:
+                row.update(self._update_payload)
+                updated_rows.append(dict(row))
+            return _FakeResponse(updated_rows)
         return _FakeResponse(filtered[self._start:self._end + 1])
 
     def order(self, _field: str, desc: bool = False):
@@ -100,6 +112,175 @@ class _FakeClient:
 
 
 class SupabaseStoreTests(unittest.TestCase):
+    def test_run_flu_season_rollover_updates_target_rows_and_deactivates_duplicates(self) -> None:
+        query_logs: dict[str, list[tuple[int, int]]] = {}
+        recall_rows = [
+            {
+                "id": "rec-1",
+                "surgery_id": "s1",
+                "patient_id": "p1",
+                "vaccine_group": "Flu",
+                "recommendation_type": "seasonal",
+                "program_area": "seasonal_adult",
+                "due_date": "2025-09-01",
+                "status": "overdue",
+                "is_active": True,
+                "updated_at": "2026-03-01T10:00:00+00:00",
+            },
+            {
+                "id": "rec-2",
+                "surgery_id": "s1",
+                "patient_id": "p2",
+                "vaccine_group": "Flu",
+                "recommendation_type": "seasonal",
+                "program_area": "seasonal_adult",
+                "due_date": "2026-09-01",
+                "status": "overdue",
+                "is_active": True,
+                "updated_at": "2026-03-02T10:00:00+00:00",
+            },
+            {
+                "id": "rec-3",
+                "surgery_id": "s1",
+                "patient_id": "p2",
+                "vaccine_group": "Flu",
+                "recommendation_type": "seasonal",
+                "program_area": "seasonal_adult",
+                "due_date": "2025-09-01",
+                "status": "overdue",
+                "is_active": True,
+                "updated_at": "2026-03-01T09:00:00+00:00",
+            },
+            {
+                "id": "rec-4",
+                "surgery_id": "s1",
+                "patient_id": "p3",
+                "vaccine_group": "Flu",
+                "recommendation_type": "seasonal",
+                "program_area": "seasonal_child",
+                "due_date": "2026-09-01",
+                "status": "overdue",
+                "is_active": True,
+                "updated_at": "2026-03-03T10:00:00+00:00",
+            },
+            {
+                "id": "rec-5",
+                "surgery_id": "s2",
+                "patient_id": "other",
+                "vaccine_group": "Flu",
+                "recommendation_type": "seasonal",
+                "program_area": "seasonal_adult",
+                "due_date": "2025-09-01",
+                "status": "overdue",
+                "is_active": True,
+                "updated_at": "2026-03-01T10:00:00+00:00",
+            },
+        ]
+        store = object.__new__(SupabaseStore)
+        store.client = _FakeClient({"recall_recommendations": recall_rows}, query_logs)
+        user_context = UserContext(
+            email="staff@example.com",
+            full_name="Staff User",
+            role="staff",
+            surgery_id="s1",
+        )
+
+        result = store.run_flu_season_rollover(
+            user_context=user_context,
+            surgery_id="s1",
+            reference_date=date(2026, 3, 8),
+        )
+
+        self.assertEqual(result["target_due_date"], "2026-09-01")
+        self.assertEqual(result["target_status"], "due_soon")
+        self.assertEqual(result["examined_count"], 4)
+        self.assertEqual(result["updated_count"], 3)
+        self.assertEqual(result["deactivated_count"], 1)
+        self.assertEqual(recall_rows[0]["due_date"], "2026-09-01")
+        self.assertEqual(recall_rows[0]["status"], "due_soon")
+        self.assertEqual(recall_rows[1]["status"], "due_soon")
+        self.assertFalse(recall_rows[2]["is_active"])
+        self.assertEqual(recall_rows[3]["status"], "due_soon")
+        self.assertEqual(recall_rows[4]["due_date"], "2025-09-01")
+
+    def test_run_covid_season_rollover_updates_target_rows_and_deactivates_duplicates(self) -> None:
+        query_logs: dict[str, list[tuple[int, int]]] = {}
+        recall_rows = [
+            {
+                "id": "covid-1",
+                "surgery_id": "s1",
+                "patient_id": "p1",
+                "vaccine_group": "COVID-19",
+                "recommendation_type": "seasonal",
+                "program_area": "seasonal_adult",
+                "due_date": "2026-01-01",
+                "status": "overdue",
+                "is_active": True,
+                "updated_at": "2026-03-01T10:00:00+00:00",
+            },
+            {
+                "id": "covid-2",
+                "surgery_id": "s1",
+                "patient_id": "p2",
+                "vaccine_group": "COVID-19",
+                "recommendation_type": "seasonal",
+                "program_area": "seasonal_adult",
+                "due_date": "2026-04-13",
+                "status": "overdue",
+                "is_active": True,
+                "updated_at": "2026-03-02T10:00:00+00:00",
+            },
+            {
+                "id": "covid-3",
+                "surgery_id": "s1",
+                "patient_id": "p2",
+                "vaccine_group": "COVID-19",
+                "recommendation_type": "seasonal",
+                "program_area": "seasonal_adult",
+                "due_date": "2026-01-01",
+                "status": "overdue",
+                "is_active": True,
+                "updated_at": "2026-03-01T09:00:00+00:00",
+            },
+            {
+                "id": "covid-4",
+                "surgery_id": "s2",
+                "patient_id": "other",
+                "vaccine_group": "COVID-19",
+                "recommendation_type": "seasonal",
+                "program_area": "seasonal_adult",
+                "due_date": "2026-01-01",
+                "status": "overdue",
+                "is_active": True,
+                "updated_at": "2026-03-01T10:00:00+00:00",
+            },
+        ]
+        store = object.__new__(SupabaseStore)
+        store.client = _FakeClient({"recall_recommendations": recall_rows}, query_logs)
+        user_context = UserContext(
+            email="staff@example.com",
+            full_name="Staff User",
+            role="staff",
+            surgery_id="s1",
+        )
+
+        result = store.run_covid_season_rollover(
+            user_context=user_context,
+            surgery_id="s1",
+            reference_date=date(2026, 3, 9),
+        )
+
+        self.assertEqual(result["target_due_date"], "2026-04-13")
+        self.assertEqual(result["target_status"], "due_soon")
+        self.assertEqual(result["examined_count"], 3)
+        self.assertEqual(result["updated_count"], 2)
+        self.assertEqual(result["deactivated_count"], 1)
+        self.assertEqual(recall_rows[0]["due_date"], "2026-04-13")
+        self.assertEqual(recall_rows[0]["status"], "due_soon")
+        self.assertEqual(recall_rows[1]["status"], "due_soon")
+        self.assertFalse(recall_rows[2]["is_active"])
+        self.assertEqual(recall_rows[3]["due_date"], "2026-01-01")
+
     def test_list_import_batches_paginates_past_first_page(self) -> None:
         batch_rows = [
             {

@@ -5,10 +5,28 @@ from datetime import date
 
 import pandas as pd
 
-from safestart2.processing import build_patients_from_dataframe, build_patients_from_rows, process_immunizeme_rows
+from safestart2.processing import (
+    build_patients_from_dataframe,
+    build_patients_from_rows,
+    process_immunizeme_dataframe,
+    process_immunizeme_rows,
+)
+from safestart2.schedule import current_covid_season_start, current_flu_season_start
 
 
 class ProcessImmunizeMeRowsTests(unittest.TestCase):
+    def test_flu_season_start_stays_in_previous_season_through_january(self) -> None:
+        self.assertEqual(current_flu_season_start(date(2026, 1, 31)), date(2025, 9, 1))
+
+    def test_flu_season_start_moves_to_next_season_from_february(self) -> None:
+        self.assertEqual(current_flu_season_start(date(2026, 3, 8)), date(2026, 9, 1))
+
+    def test_covid_season_start_uses_spring_campaign_before_april(self) -> None:
+        self.assertEqual(current_covid_season_start(date(2026, 3, 9)), date(2026, 4, 13))
+
+    def test_covid_season_start_uses_autumn_campaign_between_campaigns(self) -> None:
+        self.assertEqual(current_covid_season_start(date(2026, 8, 1)), date(2026, 10, 1))
+
     def test_process_immunizeme_rows_uses_internal_raw_payloads(self) -> None:
         rows = [
             {
@@ -68,6 +86,96 @@ class ProcessImmunizeMeRowsTests(unittest.TestCase):
         shingles_recalls = [item for item in cohort.recommendations if item.vaccine_group == "Shingles"]
         self.assertEqual(len(shingles_recalls), 1)
         self.assertEqual(shingles_recalls[0].due_date, date(2026, 3, 15))
+
+    def test_adult_flu_due_date_uses_next_season_after_january(self) -> None:
+        rows = [
+            {
+                "source_patient_id": "1",
+                "first_name": "Flu",
+                "last_name": "Eligible",
+                "nhs_number": "7000000002",
+                "sex": "F",
+                "date_of_birth": "1959-01-10",
+                "registration_date": "2000-01-01",
+                "raw_vaccine_name": "Unknown",
+                "phone": "07486321744",
+                "email": "flu@example.com",
+                "event_date": None,
+                "event_done_at_id": "evt-flu",
+            }
+        ]
+
+        cohort = process_immunizeme_rows(
+            rows,
+            reference_date=date(2026, 3, 8),
+            lookahead_days=30,
+            overrides=None,
+        )
+
+        flu_recalls = [item for item in cohort.recommendations if item.vaccine_group == "Flu"]
+        self.assertEqual(len(flu_recalls), 1)
+        self.assertEqual(flu_recalls[0].due_date, date(2026, 9, 1))
+        self.assertEqual(flu_recalls[0].status, "unvaccinated")
+
+    def test_dataframe_import_assigns_flu_to_next_season_after_january(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "First name": "Import",
+                    "Surname": "Patient",
+                    "NHS number": "7000000010",
+                    "Sex": "F",
+                    "Date of birth": "1959-01-10",
+                    "Registration date": "2000-01-01",
+                    "Preferred telephone number": "07486321744",
+                    "Email address": "import@example.com",
+                    "ImmunizeMe - vaccines 51-120yrs: Vaccination type": "Unknown",
+                    "ImmunizeMe - vaccines 51-120yrs: Event date": None,
+                    "ImmunizeMe - vaccines 51-120yrs: Patient ID": "7000000010",
+                }
+            ]
+        )
+
+        cohort = process_immunizeme_dataframe(
+            df,
+            reference_date=date(2026, 3, 8),
+            lookahead_days=30,
+            overrides=None,
+        )
+
+        flu_recalls = [item for item in cohort.recommendations if item.vaccine_group == "Flu"]
+        self.assertEqual(len(flu_recalls), 1)
+        self.assertEqual(flu_recalls[0].due_date, date(2026, 9, 1))
+
+    def test_adult_covid_due_date_uses_spring_campaign_in_march(self) -> None:
+        rows = [
+            {
+                "source_patient_id": "1",
+                "first_name": "Covid",
+                "last_name": "Eligible",
+                "nhs_number": "7000000011",
+                "sex": "F",
+                "date_of_birth": "1940-01-10",
+                "registration_date": "2000-01-01",
+                "raw_vaccine_name": "Unknown",
+                "phone": "07486321744",
+                "email": "covid@example.com",
+                "event_date": None,
+                "event_done_at_id": "evt-covid",
+            }
+        ]
+
+        cohort = process_immunizeme_rows(
+            rows,
+            reference_date=date(2026, 3, 9),
+            lookahead_days=30,
+            overrides=None,
+        )
+
+        covid_recalls = [item for item in cohort.recommendations if item.vaccine_group == "COVID-19"]
+        self.assertEqual(len(covid_recalls), 1)
+        self.assertEqual(covid_recalls[0].due_date, date(2026, 4, 13))
+        self.assertEqual(covid_recalls[0].status, "unvaccinated")
 
     def test_unvaccinated_patients_become_shingles_eligible_at_cutoff(self) -> None:
         rows = [
