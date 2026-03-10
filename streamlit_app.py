@@ -17,7 +17,7 @@ sys.path.insert(0, str(SAFE_START2_ROOT))
 from safestart2.config import get_resend_settings, get_smsworks_settings
 from safestart2.messaging import build_email_message, build_outreach_message, first_name
 from safestart2.parser import load_dataframe, sanitize_dataframe_columns
-from safestart2.processing import INPUT_COLUMNS, process_immunizeme_dataframe
+from safestart2.processing import INPUT_COLUMNS, classify_due_status, process_immunizeme_dataframe
 from safestart2.resend_client import build_resend_requests, send_resend_requests
 from safestart2.schedule import current_covid_season_start, current_flu_season_start, get_child_rules_for_patient
 from safestart2.smsworks import build_smsworks_dry_run_payload, send_smsworks_requests
@@ -670,6 +670,180 @@ def _suppress_recall_batch(store: SupabaseStore, user_context: UserContext, batc
     }
 
 
+def _iter_id_chunks(values: list[str], chunk_size: int) -> list[list[str]]:
+    if chunk_size <= 0:
+        return [values]
+    return [values[index:index + chunk_size] for index in range(0, len(values), chunk_size)]
+
+
+def _run_season_rollover(
+    store: SupabaseStore,
+    user_context: UserContext,
+    surgery_id: str,
+    reference_date: date,
+    *,
+    store_method_name: str,
+    vaccine_group: str,
+    program_areas: list[str],
+    target_due_date: date,
+    action_label: str,
+) -> dict:
+    store_method = getattr(store, store_method_name, None)
+    if callable(store_method):
+        return store_method(
+            user_context=user_context,
+            surgery_id=surgery_id,
+            reference_date=reference_date,
+        )
+
+    if not store.client:
+        raise RuntimeError("Supabase is not configured.")
+    if not user_context.is_authorized:
+        raise AuthorizationError(f"You must sign in before running a {action_label}.")
+    if not surgery_id:
+        raise ValueError(f"A surgery must be selected before running a {action_label}.")
+
+    target_due_date_str = target_due_date.isoformat()
+    target_status, _ = classify_due_status(target_due_date, reference_date)
+    chunk_size = int(getattr(store, "UPDATE_IDS_CHUNK_SIZE", 500) or 500)
+
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        page = (
+            store.client.table("recall_recommendations")
+            .select("id,patient_id,due_date,status,updated_at")
+            .eq("surgery_id", surgery_id)
+            .eq("is_active", True)
+            .eq("vaccine_group", vaccine_group)
+            .eq("recommendation_type", "seasonal")
+            .in_("program_area", program_areas)
+            .range(offset, offset + chunk_size - 1)
+            .execute()
+            .data
+            or []
+        )
+        if not page:
+            break
+        rows.extend(page)
+        if len(page) < chunk_size:
+            break
+        offset += chunk_size
+
+    if not rows:
+        return {
+            "target_due_date": target_due_date_str,
+            "target_status": target_status,
+            "examined_count": 0,
+            "updated_count": 0,
+            "deactivated_count": 0,
+        }
+
+    grouped_rows: dict[str, list[dict]] = {}
+    for row in rows:
+        patient_id = str(row.get("patient_id") or "")
+        if patient_id:
+            grouped_rows.setdefault(patient_id, []).append(row)
+
+    update_ids: list[str] = []
+    deactivate_ids: list[str] = []
+
+    for patient_rows in grouped_rows.values():
+        ordered_rows = sorted(
+            patient_rows,
+            key=lambda row: (
+                str(row.get("due_date") or ""),
+                str(row.get("updated_at") or ""),
+                str(row.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        target_rows = [row for row in ordered_rows if str(row.get("due_date") or "") == target_due_date_str]
+
+        if target_rows:
+            keep_row = target_rows[0]
+            if str(keep_row.get("status") or "") != target_status:
+                keep_id = str(keep_row.get("id") or "").strip()
+                if keep_id:
+                    update_ids.append(keep_id)
+            rows_to_deactivate = [row for row in ordered_rows if row is not keep_row]
+        else:
+            keep_row = ordered_rows[0]
+            keep_id = str(keep_row.get("id") or "").strip()
+            if keep_id and (
+                str(keep_row.get("due_date") or "") != target_due_date_str
+                or str(keep_row.get("status") or "") != target_status
+            ):
+                update_ids.append(keep_id)
+            rows_to_deactivate = ordered_rows[1:]
+
+        for row in rows_to_deactivate:
+            row_id = str(row.get("id") or "").strip()
+            if row_id:
+                deactivate_ids.append(row_id)
+
+    unique_update_ids = list(dict.fromkeys(update_ids))
+    unique_deactivate_ids = list(dict.fromkeys(deactivate_ids))
+
+    for chunk in _iter_id_chunks(unique_update_ids, chunk_size):
+        store.client.table("recall_recommendations").update(
+            {"due_date": target_due_date_str, "status": target_status},
+            returning="minimal",
+        ).in_("id", chunk).execute()
+
+    for chunk in _iter_id_chunks(unique_deactivate_ids, chunk_size):
+        store.client.table("recall_recommendations").update(
+            {"is_active": False},
+            returning="minimal",
+        ).in_("id", chunk).execute()
+
+    return {
+        "target_due_date": target_due_date_str,
+        "target_status": target_status,
+        "examined_count": len(rows),
+        "updated_count": len(unique_update_ids),
+        "deactivated_count": len(unique_deactivate_ids),
+    }
+
+
+def _run_flu_season_rollover(
+    store: SupabaseStore,
+    user_context: UserContext,
+    surgery_id: str,
+    reference_date: date,
+) -> dict:
+    return _run_season_rollover(
+        store,
+        user_context,
+        surgery_id,
+        reference_date,
+        store_method_name="run_flu_season_rollover",
+        vaccine_group="Flu",
+        program_areas=["seasonal_adult", "seasonal_child"],
+        target_due_date=current_flu_season_start(reference_date),
+        action_label="flu season rollover",
+    )
+
+
+def _run_covid_season_rollover(
+    store: SupabaseStore,
+    user_context: UserContext,
+    surgery_id: str,
+    reference_date: date,
+) -> dict:
+    return _run_season_rollover(
+        store,
+        user_context,
+        surgery_id,
+        reference_date,
+        store_method_name="run_covid_season_rollover",
+        vaccine_group="COVID-19",
+        program_areas=["seasonal_adult"],
+        target_due_date=current_covid_season_start(reference_date),
+        action_label="COVID-19 season rollover",
+    )
+
+
 @st.dialog("Delete Batch")
 def _confirm_delete_recall_batch_dialog(
     store: SupabaseStore,
@@ -817,11 +991,7 @@ def _confirm_flu_season_rollover_dialog(
     action_col1, action_col2 = st.columns(2)
     if action_col1.button("Continue", type="primary", icon=":material/autorenew:"):
         try:
-            result = store.run_flu_season_rollover(
-                user_context=user_context,
-                surgery_id=str(target_surgery["id"]),
-                reference_date=reference_date,
-            )
+            result = _run_flu_season_rollover(store, user_context, str(target_surgery["id"]), reference_date)
         except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
             st.error(str(exc))
         else:
@@ -870,11 +1040,7 @@ def _confirm_covid_season_rollover_dialog(
     action_col1, action_col2 = st.columns([2, 1])
     if action_col1.button("Continue", type="primary", icon=":material/autorenew:"):
         try:
-            result = store.run_covid_season_rollover(
-                user_context=user_context,
-                surgery_id=str(target_surgery["id"]),
-                reference_date=reference_date,
-            )
+            result = _run_covid_season_rollover(store, user_context, str(target_surgery["id"]), reference_date)
         except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
             st.error(str(exc))
         else:
@@ -1766,10 +1932,12 @@ def _render_worklist_tab(
                                 )
                                 if result["success"]:
                                     sent_rows.append(result)
-                                    st.toast(f"SMS sent to {patient_name}")
+                                    st.toast(f"SMS sent to {patient_name}", icon=":material/sms:")
+                                    st.success(f"SMS sent to {patient_name}", icon=":material/sms:")
                                 else:
                                     failed_rows.append(result)
-                                    st.toast(f"SMS failed for {patient_name}")
+                                    st.toast(f"SMS failed for {patient_name}", icon=":material/error:")
+                                    st.error(f"SMS failed for {patient_name}", icon=":material/error:")
                             if sent_rows:
                                 store.set_recall_batch_status(user_context, deliver_batch_id, "sent", delivery_method="sms")
                             elif failed_rows:
@@ -1780,6 +1948,7 @@ def _render_worklist_tab(
                                 st.error(f"All SMS sends failed. Failed messages: {len(failed_rows):,}.")
                             else:
                                 st.warning(f"Partial send complete. Sent {len(sent_rows):,}, failed {len(failed_rows):,}.")
+                            _invalidate_data_caches()
                             st.rerun()
             elif delivery_method == "email":
                 email_rows = [
@@ -1868,10 +2037,12 @@ def _render_worklist_tab(
                                 )
                                 if result["success"]:
                                     sent_rows.append(result)
-                                    st.toast(f"Email sent to {patient_name}")
+                                    st.toast(f"Email sent to {patient_name}", icon=":material/email:")
+                                    st.success(f"Email sent to {patient_name}", icon=":material/email:")
                                 else:
                                     failed_rows.append(result)
-                                    st.toast(f"Email failed for {patient_name}")
+                                    st.toast(f"Email failed for {patient_name}", icon=":material/error:")
+                                    st.error(f"Email failed for {patient_name}", icon=":material/error:")
                             if sent_rows:
                                 store.set_recall_batch_status(user_context, deliver_batch_id, "sent", delivery_method="email")
                             elif failed_rows:
@@ -1882,6 +2053,7 @@ def _render_worklist_tab(
                                 st.error(f"All email sends failed. Failed messages: {len(failed_rows):,}.")
                             else:
                                 st.warning(f"Partial send complete. Sent {len(sent_rows):,}, failed {len(failed_rows):,}.")
+                            _invalidate_data_caches()
                             st.rerun()
             else:
                 st.info(
