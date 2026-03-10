@@ -1967,7 +1967,6 @@ class SupabaseStore:
         if not raw_payloads:
             raise ValueError("No import rows were found for the selected batch.")
 
-        df = pd.DataFrame(raw_payloads)
         notes = self._parse_notes_json(batch.get("notes"))
         reference_date_value = notes.get("reference_date")
         reference_date = (
@@ -1980,8 +1979,8 @@ class SupabaseStore:
 
         overrides = self.get_alias_overrides(surgery_id=batch["surgery_id"])
         self._notify_progress(progress_callback, "rebuild_process", 0.15, "Reprocessing stored import rows...")
-        cohort = process_immunizeme_dataframe(
-            df,
+        cohort = process_immunizeme_rows(
+            raw_payloads,
             reference_date=reference_date,
             lookahead_days=lookahead_days,
             overrides=overrides,

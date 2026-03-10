@@ -87,6 +87,63 @@ class ProcessImmunizeMeRowsTests(unittest.TestCase):
         self.assertEqual(len(shingles_recalls), 1)
         self.assertEqual(shingles_recalls[0].due_date, date(2026, 3, 15))
 
+    def test_shingles_first_dose_before_september_2023_does_not_trigger_second_dose(self) -> None:
+        rows = [
+            {
+                "source_patient_id": "1",
+                "first_name": "PreCutoffDose",
+                "last_name": "Example",
+                "nhs_number": "7000000091",
+                "sex": "F",
+                "date_of_birth": "1958-01-10",
+                "registration_date": "2000-01-01",
+                "raw_vaccine_name": "Shingles",
+                "phone": "07486321744",
+                "email": "precutoffdose@example.com",
+                "event_date": "2023-08-31",
+                "event_done_at_id": "evt-1a",
+            }
+        ]
+
+        cohort = process_immunizeme_rows(
+            rows,
+            reference_date=date(2026, 3, 8),
+            lookahead_days=30,
+            overrides=None,
+        )
+
+        shingles_recalls = [item for item in cohort.recommendations if item.vaccine_group == "Shingles"]
+        self.assertEqual(shingles_recalls, [])
+
+    def test_zostavax_first_dose_does_not_trigger_second_dose(self) -> None:
+        rows = [
+            {
+                "source_patient_id": "1",
+                "first_name": "Zostavax",
+                "last_name": "Example",
+                "nhs_number": "7000000092",
+                "sex": "F",
+                "date_of_birth": "1959-01-10",
+                "registration_date": "2000-01-01",
+                "raw_vaccine_name": "Zostavax",
+                "phone": "07486321744",
+                "email": "zostavax@example.com",
+                "event_date": "2025-09-15",
+                "event_done_at_id": "evt-1b",
+            }
+        ]
+
+        cohort = process_immunizeme_rows(
+            rows,
+            reference_date=date(2026, 3, 8),
+            lookahead_days=30,
+            overrides=None,
+        )
+
+        self.assertEqual(cohort.patients[0].vaccine_events[0].canonical_vaccine, "Shingles")
+        shingles_recalls = [item for item in cohort.recommendations if item.vaccine_group == "Shingles"]
+        self.assertEqual(shingles_recalls, [])
+
     def test_adult_flu_due_date_uses_next_season_after_january(self) -> None:
         rows = [
             {

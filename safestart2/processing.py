@@ -231,6 +231,17 @@ def _shingles_first_dose_due_date(patient: Patient, rule: Dict[str, object]) -> 
     return first_dose_due_date
 
 
+def _is_zostavax_event(event: VaccineEvent) -> bool:
+    return "zostavax" in " ".join(event.raw_vaccine_name.strip().lower().split())
+
+
+def _shingles_first_dose_requires_second_dose(event: VaccineEvent, rule: Dict[str, object]) -> bool:
+    if not event.event_date or _is_zostavax_event(event):
+        return False
+    shingrix_two_dose_start = rule.get("shingrix_two_dose_start") or rule.get("sixty_fifth_birthday_cutoff")
+    return isinstance(shingrix_two_dose_start, date) and event.event_date >= shingrix_two_dose_start
+
+
 def _shingles_due_date(
     patient: Patient,
     observed: List[VaccineEvent],
@@ -245,7 +256,13 @@ def _shingles_due_date(
     eighty_first_birthday = _add_years(patient.date_of_birth, 81)
 
     if observed:
-        second_dose_due_date = _add_months(observed[0].event_date, 6)
+        first_dose = observed[0]
+        if not _shingles_first_dose_requires_second_dose(first_dose, rule):
+            return None
+        first_dose_date = first_dose.event_date
+        if first_dose_date is None:
+            return None
+        second_dose_due_date = _add_months(first_dose_date, 6)
         if reference_date >= eighty_first_birthday or second_dose_due_date >= eighty_first_birthday:
             return None
         return second_dose_due_date
@@ -548,6 +565,20 @@ def build_recommendations(
                 continue
 
             status, priority = classify_due_status(due_date, reference_date)
+            reason = f"Eligible for {vaccine_group} based on age and recorded history."
+            explanation = {
+                "age_years": age_years,
+                "observed_count": len(observed),
+                "dose_interval_months": 6 if vaccine_group == "Shingles" and len(observed) == 1 else None,
+            }
+            if (
+                vaccine_group == "Shingles"
+                and len(observed) == 1
+                and _shingles_first_dose_requires_second_dose(observed[0], rule)
+            ):
+                reason = "Recorded first shingles dose is part of the Shingrix course, which remains incomplete until dose 2."
+                explanation["series_status"] = "incomplete_after_dose_1"
+
             recommendations.append(
                 Recommendation(
                     patient_nhs_number=patient.nhs_number,
@@ -561,12 +592,8 @@ def build_recommendations(
                     due_date=due_date,
                     status=status,
                     priority=priority + 5,
-                    reason=f"Eligible for {vaccine_group} based on age and recorded history.",
-                    explanation={
-                        "age_years": age_years,
-                        "observed_count": len(observed),
-                        "dose_interval_months": 6 if vaccine_group == "Shingles" and len(observed) == 1 else None,
-                    },
+                    reason=reason,
+                    explanation=explanation,
                 )
             )
 

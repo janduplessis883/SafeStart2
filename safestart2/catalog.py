@@ -109,7 +109,7 @@ CANONICAL_VACCINES: Dict[str, Dict[str, object]] = {
     },
     "Shingles": {
         "program": "routine_adult",
-        "aliases": ["shingles", "shingrix", "shingrix 1", "shingrix 2", "zostavax 1"],
+        "aliases": ["shingles", "shingrix", "shingrix 1", "shingrix 2", "zostavax", "zostavax 1"],
     },
     "RSV": {
         "program": "routine_adult",
@@ -238,6 +238,7 @@ def normalize_vaccine_name(raw_name: str, overrides: Optional[Dict[str, Tuple[st
         ("pneumovax", "Pneumococcal", "routine_adult"),
         ("pneumococcal polysaccharide", "Pneumococcal", "routine_adult"),
         ("shingrix", "Shingles", "routine_adult"),
+        ("zostavax", "Shingles", "routine_adult"),
         ("abrysvo", "RSV", "routine_adult"),
         ("gardasil", "HPV", "routine_child"),
         ("comirnaty", "COVID-19", "history_only"),

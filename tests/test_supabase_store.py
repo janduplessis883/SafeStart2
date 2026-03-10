@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import date
+from unittest.mock import patch
 
 from safestart2.supabase_store import SupabaseStore, UserContext
 
@@ -37,6 +38,11 @@ class _FakeQuery:
         self._start = start
         self._end = end
         self._log.append((start, end))
+        return self
+
+    def limit(self, value: int):
+        self._start = 0
+        self._end = max(0, value - 1)
         return self
 
     def eq(self, field: str, value: object):
@@ -112,6 +118,81 @@ class _FakeClient:
 
 
 class SupabaseStoreTests(unittest.TestCase):
+    def test_rebuild_surgery_from_batch_reprocesses_stored_row_payloads(self) -> None:
+        query_logs: dict[str, list[tuple[int, int]]] = {}
+        store = object.__new__(SupabaseStore)
+        store.client = _FakeClient(
+            {
+                "import_batches": [
+                    {
+                        "id": "batch-1",
+                        "surgery_id": "s1",
+                        "uploaded_by_email": "staff@example.com",
+                        "source_filename": "upload.csv",
+                        "row_count": 1,
+                        "patient_count": 1,
+                        "recommendation_count": 1,
+                        "unvaccinated_count": 0,
+                        "imported_at": "2026-03-10T09:00:00+00:00",
+                        "notes": '{"reference_date":"2026-03-09","lookahead_days":30}',
+                    }
+                ]
+            },
+            query_logs,
+        )
+        store._get_surgery_by_id = lambda surgery_id: {
+            "id": surgery_id,
+            "surgery_code": "ABC123",
+            "surgery_name": "Example Surgery",
+            "sms_sender_id": "SafeStart2",
+        }
+        raw_payloads = [
+            {
+                "source_patient_id": "1",
+                "first_name": "Import",
+                "last_name": "Patient",
+                "nhs_number": "7000000001",
+                "sex": "F",
+                "date_of_birth": "1950-01-10",
+                "registration_date": "2000-01-01",
+                "raw_vaccine_name": "Unknown",
+                "phone": "07486321744",
+                "email": "import@example.com",
+                "event_date": None,
+                "event_done_at_id": "evt-1",
+            }
+        ]
+        store._load_import_row_payloads = lambda batch_id: raw_payloads
+        store._parse_notes_json = lambda notes: {"reference_date": "2026-03-09", "lookahead_days": 30}
+        store.get_alias_overrides = lambda surgery_id=None: {"custom": ("MMR", "routine_child")}
+        cleared: list[str] = []
+        persisted: list[dict] = []
+        store.clear_import_data = lambda user_context, surgery_id: cleared.append(surgery_id) or {}
+        store.persist_processed_cohort = (
+            lambda **kwargs: persisted.append(kwargs)
+            or {"patients": 1, "events": 1, "recommendations": 1}
+        )
+        user_context = UserContext(
+            email="staff@example.com",
+            full_name="Staff User",
+            role="staff",
+            surgery_id="s1",
+        )
+
+        with patch("safestart2.supabase_store.process_immunizeme_rows") as process_rows:
+            process_rows.return_value = "cohort"
+            result = store.rebuild_surgery_from_batch(user_context=user_context, batch_id="batch-1")
+
+        process_rows.assert_called_once_with(
+            raw_payloads,
+            reference_date=date(2026, 3, 9),
+            lookahead_days=30,
+            overrides={"custom": ("MMR", "routine_child")},
+        )
+        self.assertEqual(cleared, ["s1"])
+        self.assertEqual(persisted[0]["cohort"], "cohort")
+        self.assertEqual(result, {"patients": 1, "events": 1, "recommendations": 1})
+
     def test_run_flu_season_rollover_updates_target_rows_and_deactivates_duplicates(self) -> None:
         query_logs: dict[str, list[tuple[int, int]]] = {}
         recall_rows = [

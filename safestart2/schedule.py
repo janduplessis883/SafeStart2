@@ -111,6 +111,7 @@ def adult_due_checks(reference_date: date) -> Dict[str, Dict[str, object]]:
             "max_age_years": 79,
             "recommendation_type": "routine",
             "sixty_fifth_birthday_cutoff": date(2023, 9, 1),
+            "shingrix_two_dose_start": date(2023, 9, 1),
         },
         "RSV": {
             "program_area": "routine_adult",

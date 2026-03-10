@@ -2523,14 +2523,67 @@ def _render_import_tab(
         st.info("Upload a file or enable the attached dataset toggle to begin processing.")
         return
 
-    original_row_count = len(df)
-    df, invalid_dob_count = _filter_dataframe_by_age(
-        df,
-        reference_date=reference_date,
-        min_age_years=min_age_years,
-        max_age_years=max_age_years,
-    )
-    filtered_out_count = original_row_count - len(df)
+    import_status = st.status("Processing import file...", expanded=True)
+    try:
+        import_status.write("Reading uploaded source rows.")
+        original_row_count = len(df)
+        import_status.write(
+            f"Applying age filter {min_age_years} to {max_age_years} years using reference date {reference_date.isoformat()}."
+        )
+        df, invalid_dob_count = _filter_dataframe_by_age(
+            df,
+            reference_date=reference_date,
+            min_age_years=min_age_years,
+            max_age_years=max_age_years,
+        )
+        filtered_out_count = original_row_count - len(df)
+
+        if df.empty:
+            import_status.update(
+                label="Import processing stopped",
+                state="error",
+                expanded=True,
+            )
+            st.warning("No source rows matched the selected age range.")
+            return
+
+        import_status.write("Resolving surgery context for vaccine alias overrides.")
+        override_surgery_id = user_context.surgery_id
+        global_only_overrides = False
+        if user_context.is_superuser:
+            selected_surgery = store.find_surgery_by_code(surgery_code)
+            if selected_surgery:
+                override_surgery_id = selected_surgery["id"]
+            else:
+                override_surgery_id = None
+                global_only_overrides = True
+
+        import_status.write("Loading vaccine alias overrides.")
+        overrides = store.get_alias_overrides(
+            surgery_id=override_surgery_id,
+            global_only=global_only_overrides,
+        )
+        import_status.write("Normalizing patient rows and vaccine events.")
+        import_status.write("Calculating recall recommendations for the filtered cohort.")
+        processed = process_immunizeme_dataframe(
+            df,
+            reference_date=reference_date,
+            lookahead_days=lookahead_days,
+            overrides=overrides,
+        )
+        import_status.write("Preparing recommendation and patient preview tables.")
+        import_status.update(
+            label="Import processing complete",
+            state="complete",
+            expanded=False,
+        )
+    except Exception:
+        import_status.update(
+            label="Import processing failed",
+            state="error",
+            expanded=True,
+        )
+        raise
 
     if min_age_years > 0 or max_age_years < 120:
         st.caption(
@@ -2539,30 +2592,6 @@ def _render_import_tab(
         )
     if invalid_dob_count:
         st.caption(f"Rows with unreadable DOB values before filtering: {invalid_dob_count:,}.")
-    if df.empty:
-        st.warning("No source rows matched the selected age range.")
-        return
-
-    override_surgery_id = user_context.surgery_id
-    global_only_overrides = False
-    if user_context.is_superuser:
-        selected_surgery = store.find_surgery_by_code(surgery_code)
-        if selected_surgery:
-            override_surgery_id = selected_surgery["id"]
-        else:
-            override_surgery_id = None
-            global_only_overrides = True
-
-    overrides = store.get_alias_overrides(
-        surgery_id=override_surgery_id,
-        global_only=global_only_overrides,
-    )
-    processed = process_immunizeme_dataframe(
-        df,
-        reference_date=reference_date,
-        lookahead_days=lookahead_days,
-        overrides=overrides,
-    )
 
     st.success(
         f"Processed {processed.raw_rows:,} rows into {len(processed.patients):,} patients and "
