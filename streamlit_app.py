@@ -18,6 +18,7 @@ from safestart2.config import get_resend_settings, get_smsworks_settings
 from safestart2.messaging import build_email_message, build_outreach_message, first_name
 from safestart2.parser import load_dataframe, sanitize_dataframe_columns
 from safestart2.processing import INPUT_COLUMNS, classify_due_status, process_immunizeme_dataframe
+from safestart2.recalls import group_recalls
 from safestart2.resend_client import build_resend_requests, send_resend_requests
 from safestart2.schedule import current_covid_season_start, current_flu_season_start, get_child_rules_for_patient
 from safestart2.smsworks import build_smsworks_dry_run_payload, send_smsworks_requests
@@ -58,6 +59,7 @@ def _clear_session() -> None:
 
 def _invalidate_data_caches() -> None:
     st.session_state.pop("worklist_data_cache", None)
+    st.session_state.pop("recall_batch_data_cache", None)
     st.session_state.pop("vaccination_events_patient_cache", None)
     st.session_state.pop("patient_timeline_cache", None)
 
@@ -193,6 +195,22 @@ def _get_cached_worklist_data(
                 "Workflow filters are unavailable until `sql/003_bulk_sms_batches.sql` is applied: "
                 f"{exc}"
             )
+        cache[cache_key] = {
+            "recalls": recalls,
+            "attempt_rows": attempt_rows,
+            "attempt_error": attempt_error,
+        }
+    return dict(cache[cache_key])
+
+
+def _get_cached_recall_batch_data(
+    store: SupabaseStore,
+    user_context: UserContext,
+    surgery_id: Optional[str],
+) -> dict:
+    cache = st.session_state.setdefault("recall_batch_data_cache", {})
+    cache_key = _worklist_cache_key(user_context, surgery_id=surgery_id)
+    if cache_key not in cache:
         try:
             recall_batches = store.list_recall_batches(user_context, surgery_id=surgery_id)
             recall_batch_error = None
@@ -200,9 +218,6 @@ def _get_cached_worklist_data(
             recall_batches = []
             recall_batch_error = str(exc)
         cache[cache_key] = {
-            "recalls": recalls,
-            "attempt_rows": attempt_rows,
-            "attempt_error": attempt_error,
             "recall_batches": recall_batches,
             "recall_batch_error": recall_batch_error,
         }
@@ -1143,14 +1158,24 @@ def _build_recall_overlay_timeline_df(event_rows: list[dict], recall: dict) -> p
             for event in event_rows
         ]
     )
-    for vaccine in recall.get("vaccines", []):
+    due_items = list(recall.get("due_items") or [])
+    if not due_items:
+        due_items = [
+            {
+                "vaccine": vaccine,
+                "due_date": recall.get("due_date"),
+                "reason": recall.get("reason"),
+            }
+            for vaccine in recall.get("vaccines", [])
+        ]
+    for due_item in due_items:
         rows.append(
             {
-                "Event Date": due_date,
-                "Vaccine": vaccine,
+                "Event Date": pd.to_datetime(due_item.get("due_date"), errors="coerce"),
+                "Vaccine": due_item.get("vaccine") or "Unknown",
                 "Program": recall.get("status") or "—",
                 "Marker": "Recall due",
-                "Detail": recall.get("reason") or "—",
+                "Detail": due_item.get("reason") or recall.get("reason") or "—",
             }
         )
     return pd.DataFrame(rows).dropna(subset=["Event Date"])
@@ -1166,103 +1191,7 @@ def _build_vaccine_grid_chart(vaccine_order: list[str]) -> alt.Chart:
 
 
 def _group_recalls(recalls: list[dict]) -> list[dict]:
-    grouped: dict[tuple[object, ...], dict] = {}
-    for recall in recalls:
-        key = (
-            recall.get("surgery_id"),
-            recall.get("nhs_number"),
-            recall.get("due_date"),
-            recall.get("status"),
-        )
-        group = grouped.get(key)
-        if group is None:
-            group = {
-                "group_id": "|".join(
-                    [
-                        str(recall.get("surgery_id") or ""),
-                        str(recall.get("nhs_number") or ""),
-                        str(recall.get("due_date") or ""),
-                        str(recall.get("status") or ""),
-                    ]
-                ),
-                "surgery_id": recall.get("surgery_id"),
-                "surgery_code": recall.get("surgery_code"),
-                "surgery_name": recall.get("surgery_name"),
-                "nhs_number": recall.get("nhs_number"),
-                "full_name": recall.get("full_name"),
-                "date_of_birth": recall.get("date_of_birth"),
-                "phone": recall.get("phone"),
-                "email": recall.get("email"),
-                "surgery_email": recall.get("surgery_email"),
-                "due_date": recall.get("due_date"),
-                "status": recall.get("status"),
-                "priority": recall.get("priority"),
-                "program_areas": [],
-                "reasons": [],
-                "recommendations": [],
-                "recommendation_ids": [],
-                "vaccines": [],
-                "attempt_count": 0,
-                "last_attempt_at": None,
-                "last_attempt_method": None,
-                "last_attempt_outcome": None,
-            }
-            grouped[key] = group
-
-        group["recommendations"].append(recall)
-        group["recommendation_ids"].append(recall["id"])
-        group["vaccines"].append(str(recall.get("vaccine_group") or "Unknown"))
-        group["program_areas"].append(str(recall.get("program_area") or ""))
-        group["reasons"].append(str(recall.get("reason") or ""))
-
-        priority = recall.get("priority")
-        if priority is not None:
-            current_priority = group.get("priority")
-            group["priority"] = priority if current_priority is None else min(current_priority, priority)
-
-        if not group.get("email") and recall.get("email"):
-            group["email"] = recall.get("email")
-        if not group.get("surgery_email") and recall.get("surgery_email"):
-            group["surgery_email"] = recall.get("surgery_email")
-
-        attempt_count = int(recall.get("attempt_count") or 0)
-        if attempt_count > int(group.get("attempt_count") or 0):
-            group["attempt_count"] = attempt_count
-            group["last_attempt_at"] = recall.get("last_attempt_at")
-            group["last_attempt_method"] = recall.get("last_attempt_method")
-            group["last_attempt_outcome"] = recall.get("last_attempt_outcome")
-
-    grouped_recalls = []
-    for group in grouped.values():
-        vaccine_list = sorted(set(group["vaccines"]))
-        program_list = sorted(set(item for item in group["program_areas"] if item))
-        reason_list = sorted(set(item for item in group["reasons"] if item))
-        grouped_recalls.append(
-            {
-                **group,
-                "vaccines": vaccine_list,
-                "vaccines_display": ", ".join(vaccine_list),
-                "program_areas": program_list,
-                "program_area_display": ", ".join(program_list),
-                "reasons": reason_list,
-                "reason": " | ".join(reason_list),
-                "recommendation_count": len(group["recommendation_ids"]),
-                "explanation": {
-                    "vaccines": vaccine_list,
-                    "program_areas": program_list,
-                    "recommendation_ids": group["recommendation_ids"],
-                },
-            }
-        )
-
-    grouped_recalls.sort(
-        key=lambda recall: (
-            int(recall.get("priority") or 999),
-            recall.get("due_date") or "9999-12-31",
-            recall.get("full_name") or "",
-        )
-    )
-    return grouped_recalls
+    return group_recalls(recalls)
 
 
 def _render_worklist_tab(
@@ -1357,8 +1286,9 @@ def _render_worklist_tab(
         if str(row.get("recommendation_id") or "") in selected_recommendation_ids
     ]
     attempts_by_group = _build_attempts_by_group(grouped_recalls, all_attempt_rows)
-    recall_batches = worklist_data.get("recall_batches", [])
-    recall_batch_error = worklist_data.get("recall_batch_error")
+    recall_batch_data: Optional[dict] = None
+    recall_batches: list[dict] = []
+    recall_batch_error: Optional[str] = None
 
     metric1, metric2, metric3, metric4, metric5 = st.columns(5)
     metric1.metric("Patient Recalls", f"{len(grouped_recalls):,}")
@@ -1367,81 +1297,100 @@ def _render_worklist_tab(
     metric4.metric("Due Now", f"{sum(item['status'] == 'due_now' for item in grouped_recalls):,}")
     metric5.metric("Unvaccinated", f"{sum(item['status'] == 'unvaccinated' for item in grouped_recalls):,}")
     with st.expander("1. Filter Recall Recommendations", expanded=True, icon=":material/filter_list:"):
-        filter_col1, filter_col2, filter_col3, filter_col4, filter_col5, filter_col6 = st.columns([1.1, 1.1, 1, 1.1, 0.9, 0.8])
-        all_statuses = sorted({recall["status"] for recall in grouped_recalls})
-        status_filter = filter_col1.multiselect(
-            "Statuses",
-            options=all_statuses,
-            default=all_statuses,
-            key="worklist_status_filter",
-        )
-        workflow_options = [
-            workflow
-            for workflow in WORKFLOW_STATES
-            if any(classify_recall_workflow(recall, attempts_by_group.get(recall["group_id"], [])) == workflow for recall in grouped_recalls)
-        ]
-        workflow_filter = filter_col2.multiselect(
-            "Workflow",
-            options=workflow_options,
-            default=workflow_options,
-            key="worklist_workflow_filter",
-        )
-        vaccine_filter = filter_col3.text_input(
-            "Vaccine filter",
-            placeholder="e.g. MMR",
-            key="worklist_vaccine_filter",
-        )
-        search_filter = filter_col4.text_input(
-            "Patient or NHS search",
-            placeholder="Name, NHS, phone, reason",
-            key="worklist_search_filter",
-        )
-        sort_by = filter_col5.selectbox(
-            "Sort by",
-            options=["Priority", "Due date", "Age", "Patient name", "Attempts"],
-            key="worklist_sort_by",
-        )
-        sort_desc = filter_col6.toggle(
-            "Descending",
-            value=False,
-            key="worklist_sort_desc",
-        )
-        worklist_min_age, worklist_max_age = st.slider(
-            "Recall age range (years)",
-            min_value=0,
-            max_value=120,
-            value=(0, 120),
-            step=1,
-            key="worklist_age_filter",
-        )
-        exclusion_col1, exclusion_col2, exclusion_col3, exclusion_col4 = st.columns(4)
-        exclude_no_phone = exclusion_col1.toggle(
-            "Exclude **no phone**",
-            value=False,
-            key="worklist_exclude_no_phone",
-        )
-        exclude_sent_recently = exclusion_col2.toggle(
-            "Exclude **sent** in recent activity lookback days",
-            value=True,
-            key="worklist_exclude_sent_recently",
-        )
-        exclude_prepared_recently = exclusion_col3.toggle(
-            "Exclude **prepared** in recent activity lookback days",
-            value=False,
-            key="worklist_exclude_prepared_recently",
-        )
-        lookback_days = exclusion_col4.number_input(
-            "Recent activity lookback (days)",
-            min_value=1,
-            max_value=365,
-            value=14,
-            step=1,
-            key="worklist_recent_activity_days",
-            disabled=not (exclude_sent_recently or exclude_prepared_recently),
-        )
+        with st.form("worklist_filter_form", clear_on_submit=False):
+            filter_col1, filter_col2, filter_col3, filter_col4, filter_col5, filter_col6 = st.columns([1.1, 1.1, 1, 1.1, 0.9, 0.8])
+            all_statuses = sorted({recall["status"] for recall in grouped_recalls})
+            status_filter = filter_col1.multiselect(
+                "Statuses",
+                options=all_statuses,
+                default=all_statuses,
+                key="worklist_status_filter",
+            )
+            workflow_options = [
+                workflow
+                for workflow in WORKFLOW_STATES
+                if any(classify_recall_workflow(recall, attempts_by_group.get(recall["group_id"], [])) == workflow for recall in grouped_recalls)
+            ]
+            workflow_filter = filter_col2.multiselect(
+                "Workflow",
+                options=workflow_options,
+                default=workflow_options,
+                key="worklist_workflow_filter",
+            )
+            vaccine_filter = filter_col3.text_input(
+                "Vaccine filter",
+                placeholder="e.g. MMR",
+                key="worklist_vaccine_filter",
+            )
+            search_filter = filter_col4.text_input(
+                "Patient or NHS search",
+                placeholder="Name, NHS, phone, reason",
+                key="worklist_search_filter",
+            )
+            sort_by = filter_col5.selectbox(
+                "Sort by",
+                options=["Priority", "Due date", "Age", "Patient name", "Attempts"],
+                key="worklist_sort_by",
+            )
+            sort_desc = filter_col6.toggle(
+                "Descending",
+                value=False,
+                key="worklist_sort_desc",
+            )
+            worklist_min_age, worklist_max_age = st.slider(
+                "Recall age range (years)",
+                min_value=0,
+                max_value=120,
+                value=(0, 120),
+                step=1,
+                key="worklist_age_filter",
+            )
+            exclusion_col1, exclusion_col2, exclusion_col3, exclusion_col4 = st.columns(4)
+            exclude_no_phone = exclusion_col1.toggle(
+                "Exclude **no phone**",
+                value=False,
+                key="worklist_exclude_no_phone",
+            )
+            exclude_sent_recently = exclusion_col2.toggle(
+                "Exclude **sent** in recent activity lookback days",
+                value=True,
+                key="worklist_exclude_sent_recently",
+            )
+            exclude_prepared_recently = exclusion_col3.toggle(
+                "Exclude **prepared** in recent activity lookback days",
+                value=False,
+                key="worklist_exclude_prepared_recently",
+            )
+            lookback_days = exclusion_col4.number_input(
+                "Recent activity lookback (days)",
+                min_value=1,
+                max_value=365,
+                value=14,
+                step=1,
+                key="worklist_recent_activity_days",
+                disabled=not (exclude_sent_recently or exclude_prepared_recently),
+            )
+            st.form_submit_button(
+                "Apply filters",
+                type="primary",
+                icon=":material/filter_alt:",
+            )
 
         recent_batch_group_ids: set[str] = set()
-        if exclude_prepared_recently and recall_batches:
+        if exclude_prepared_recently:
+            recall_batch_data = _get_cached_recall_batch_data(
+                store,
+                user_context,
+                surgery_id=selected_surgery_id,
+            )
+            recall_batches = recall_batch_data.get("recall_batches", [])
+            recall_batch_error = recall_batch_data.get("recall_batch_error")
+        if exclude_prepared_recently and recall_batch_error:
+            st.error(
+                "Prepared-batch filtering is unavailable until `sql/007_recall_batches.sql` is applied: "
+                f"{recall_batch_error}"
+            )
+        elif exclude_prepared_recently and recall_batches:
             recent_batch_cutoff = pd.Timestamp.now(tz="Europe/London") - pd.Timedelta(days=int(lookback_days))
             for batch in recall_batches:
                 created_at = pd.to_datetime(batch.get("created_at"), errors="coerce", utc=True)
@@ -1605,588 +1554,656 @@ def _render_worklist_tab(
             analytics_col2.dataframe(vaccine_summary_df, width="stretch", hide_index=True)
             analytics_col3.dataframe(age_band_summary_df, width="stretch", hide_index=True)
 
-    recall_map = {recall["group_id"]: recall for recall in filtered_recalls}
-    batch_candidate_rows = _build_recall_batch_rows(filtered_recalls, self_book_url=self_book_url)
-    batch_candidate_map = {row["Group ID"]: row for row in batch_candidate_rows}
+    open_recall_expander = st.expander(
+        "2. Open Recall",
+        expanded=False,
+        icon=":material/person_check:",
+        on_change="rerun",
+        key="worklist_open_recall_expander",
+    )
+    prepare_batch_expander = st.expander(
+        "3. Prepare Batch",
+        expanded=False,
+        icon=":material/batch_prediction:",
+        on_change="rerun",
+        key="worklist_prepare_batch_expander",
+    )
+    deliver_batch_expander = st.expander(
+        "4. Deliver Batch",
+        expanded=False,
+        icon=":material/send:",
+        on_change="rerun",
+        key="worklist_deliver_batch_expander",
+    )
+    history_expander = st.expander(
+        "5. Batch History",
+        expanded=False,
+        icon=":material/history:",
+        on_change="rerun",
+        key="worklist_batch_history_expander",
+    )
+    manual_outcome_expander = st.expander(
+        "6. Manual Batch Outcome",
+        expanded=False,
+        icon=":material/attach_file:",
+        on_change="rerun",
+        key="worklist_manual_batch_expander",
+    )
 
-    with st.expander("2. Open Recall", expanded=False, icon=":material/person_check:"):
-        selected_recall_id = st.selectbox(
-            "Open recall",
-            options=list(recall_map),
-            format_func=lambda recall_id: _recall_option_label(recall_map[recall_id]),
-            help="Inspect one filtered patient recall in detail before deciding whether and how to include it in a batch.",
-            key="worklist_selected_recall",
+    recall_map = (
+        {recall["group_id"]: recall for recall in filtered_recalls}
+        if open_recall_expander.open or prepare_batch_expander.open or deliver_batch_expander.open
+        else {}
+    )
+    batch_candidate_map: dict[str, dict] = {}
+    if prepare_batch_expander.open or deliver_batch_expander.open:
+        batch_candidate_rows = _build_recall_batch_rows(filtered_recalls, self_book_url=self_book_url)
+        batch_candidate_map = {row["Group ID"]: row for row in batch_candidate_rows}
+
+    if (
+        deliver_batch_expander.open
+        or history_expander.open
+        or manual_outcome_expander.open
+    ) and recall_batch_data is None:
+        recall_batch_data = _get_cached_recall_batch_data(
+            store,
+            user_context,
+            surgery_id=selected_surgery_id,
         )
-        selected_recall = recall_map[selected_recall_id]
+        recall_batches = recall_batch_data.get("recall_batches", [])
+        recall_batch_error = recall_batch_data.get("recall_batch_error")
 
-        attempts = store.list_recall_attempts_for_recommendations(selected_recall["recommendation_ids"])
-        try:
-            patient_timeline = store.get_patient_timeline(
-                user_context=user_context,
-                surgery_id=str(selected_recall.get("surgery_id") or ""),
-                nhs_number=str(selected_recall.get("nhs_number") or ""),
+    if open_recall_expander.open:
+        with open_recall_expander:
+            selected_recall_id = st.selectbox(
+                "Open recall",
+                options=list(recall_map),
+                format_func=lambda recall_id: _recall_option_label(recall_map[recall_id]),
+                help="Inspect one filtered patient recall in detail before deciding whether and how to include it in a batch.",
+                key="worklist_selected_recall",
             )
-        except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
-            st.error(str(exc))
-            patient_timeline = {"events": [], "attempts": []}
+            selected_recall = recall_map[selected_recall_id]
 
-        patient_summary = summarize_patient_recall(
-            selected_recall,
-            attempts_by_group.get(selected_recall["group_id"], []),
-            patient_timeline,
-            sent_recently_days=14,
-        )
-        summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
-        summary_col1.metric("Workflow", str(patient_summary["workflow_state"]))
-        summary_col2.metric("Due Vaccines", f"{len(patient_summary['due_vaccines']):,}")
-        summary_col3.metric("Last Vaccination", _format_date(patient_summary.get("last_vaccination_date")))
-        last_outreach_label = _format_ts(patient_summary.get("last_outreach_at"))
-        if patient_summary.get("last_outreach_method"):
-            last_outreach_label = f"{last_outreach_label} | {patient_summary['last_outreach_method']}"
-        summary_col4.metric("Last Outreach", last_outreach_label)
-        st.info(f"Next action: {patient_summary['next_action']}")
-
-        overlay_timeline_df = _build_recall_overlay_timeline_df(
-            patient_timeline.get("events", []),
-            selected_recall,
-        )
-        if overlay_timeline_df.empty:
-            st.caption("No recorded vaccine events or recall due date are available to plot.")
-        else:
-            vaccine_order = sorted(overlay_timeline_df["Vaccine"].unique())
-            grid_chart = _build_vaccine_grid_chart(vaccine_order)
-            base_chart = alt.Chart(overlay_timeline_df).encode(
-                x=alt.X("Event Date:T", axis=alt.Axis(grid=False)),
-                y=alt.Y("Vaccine:N", sort=vaccine_order, axis=alt.Axis(grid=False)),
-                tooltip=["Event Date:T", "Vaccine:N", "Marker:N", "Program:N", "Detail:N"],
-            )
-            schedule_chart = base_chart.transform_filter(alt.datum.Marker == "Routine schedule").mark_circle(size=130, opacity=0.95).encode(color=alt.value("#e8e8eb"))
-            recorded_chart = base_chart.transform_filter(alt.datum.Marker == "Recorded").mark_circle(size=150).encode(color=alt.value("#4294c2"))
-            recall_chart = base_chart.transform_filter(alt.datum.Marker == "Recall due").mark_circle(size=170).encode(color=alt.value("#ae4f4d"))
-            st.altair_chart(
-                alt.layer(grid_chart, schedule_chart, recorded_chart, recall_chart)
-                .resolve_scale(color="independent")
-                .properties(height=max(220, 34 * overlay_timeline_df["Vaccine"].nunique())),
-                width="stretch",
-            )
-
-        detail_col1, detail_col2 = st.columns([1.2, 1])
-        with detail_col1:
-            st.markdown(f"### {selected_recall['full_name']}")
-            st.write(f"NHS: `{selected_recall['nhs_number']}`")
-            st.write(f"DOB: {_format_date(selected_recall.get('date_of_birth'))}")
-            st.write(f"Age: {_format_age_from_dob(selected_recall.get('date_of_birth'))}")
-            st.write(f"Phone: {selected_recall.get('phone') or '—'}")
-            st.write(f"Email: {selected_recall.get('email') or '—'}")
-            if selected_recall.get("surgery_code"):
-                st.write(f"Surgery: `{selected_recall['surgery_code']}`")
-            st.write(f"Vaccines: `{selected_recall['vaccines_display']}`")
-            st.write(f"Status: `{selected_recall['status']}`")
-            st.write(f"Due Date: {_format_date(selected_recall.get('due_date'))}")
-            st.write(f"Priority: `{selected_recall['priority']}`")
-            for reason in selected_recall["reasons"]:
-                st.write(f"- {reason}")
-        with detail_col2:
-            st.markdown("### Metadata")
-            st.json(selected_recall.get("explanation") or {})
-
-        if attempts:
-            attempts_df = pd.DataFrame(
-                [
-                    {
-                        "Sent At": _format_ts(attempt.get("sent_at")),
-                        "Method": attempt.get("communication_method") or "—",
-                        "Outcome": attempt.get("outcome") or "—",
-                        "Staff": attempt.get("staff_member") or "—",
-                        "Recall Items": attempt.get("recommendation_count") or "—",
-                        "Message": attempt.get("notes") or "—",
-                    }
-                    for attempt in attempts
-                ]
-            )
-            st.dataframe(attempts_df, width="stretch", hide_index=True)
-        else:
-            st.caption("No recall attempts have been logged for this patient recall yet.")
-
-        action_col1, action_col2 = st.columns(2)
-        if action_col1.button("Mark complete", key=f"complete_{selected_recall['group_id']}", width="stretch", icon=":material/done_outline:"):
+            attempts = store.list_recall_attempts_for_recommendations(selected_recall["recommendation_ids"])
             try:
-                store.close_recall_group(user_context, selected_recall["recommendation_ids"], "complete")
+                patient_timeline = _get_cached_patient_timeline(
+                    store,
+                    user_context=user_context,
+                    surgery_id=str(selected_recall.get("surgery_id") or ""),
+                    nhs_number=str(selected_recall.get("nhs_number") or ""),
+                )
             except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
                 st.error(str(exc))
-            else:
-                st.success("Recall marked complete.")
-                _invalidate_data_caches()
-                st.rerun()
-        action_col1.caption("Use when this recall has been resolved and no further action is needed.")
-        if action_col2.button("Suppress recall", key=f"suppress_{selected_recall['group_id']}", width="stretch", icon=":material/close:"):
-            try:
-                store.close_recall_group(user_context, selected_recall["recommendation_ids"], "suppressed")
-            except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
-                st.error(str(exc))
-            else:
-                st.success("Recall suppressed.")
-                _invalidate_data_caches()
-                st.rerun()
-        action_col2.caption("Use when you want to remove it from the worklist without treating it as completed.")
+                patient_timeline = {"events": [], "attempts": []}
 
-    with st.expander("3. Prepare Batch", expanded=False, icon=":material/batch_prediction:"):
-        batch_group_ids = st.multiselect(
-            "Select patient recalls for batch",
-            options=list(recall_map),
-            format_func=lambda recall_id: _recall_option_label(recall_map[recall_id]),
-            key="worklist_generic_batch_selection",
-            help="Create a generic recall batch from the filtered cohort. You can choose SMS, email, letter, or call later in the delivery step.",
-        )
-        if batch_group_ids:
-            selected_batch_rows = [batch_candidate_map[recall_id] for recall_id in batch_group_ids]
-            st.dataframe(
-                pd.DataFrame(
+            patient_summary = summarize_patient_recall(
+                selected_recall,
+                attempts_by_group.get(selected_recall["group_id"], []),
+                patient_timeline,
+                sent_recently_days=14,
+            )
+            summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+            summary_col1.metric("Workflow", str(patient_summary["workflow_state"]))
+            summary_col2.metric("Due Vaccines", f"{len(patient_summary['due_vaccines']):,}")
+            summary_col3.metric("Last Vaccination", _format_date(patient_summary.get("last_vaccination_date")))
+            last_outreach_label = _format_ts(patient_summary.get("last_outreach_at"))
+            if patient_summary.get("last_outreach_method"):
+                last_outreach_label = f"{last_outreach_label} | {patient_summary['last_outreach_method']}"
+            summary_col4.metric("Last Outreach", last_outreach_label)
+            st.info(f"Next action: {patient_summary['next_action']}")
+
+            overlay_timeline_df = _build_recall_overlay_timeline_df(
+                patient_timeline.get("events", []),
+                selected_recall,
+            )
+            if overlay_timeline_df.empty:
+                st.caption("No recorded vaccine events or recall due date are available to plot.")
+            else:
+                vaccine_order = sorted(overlay_timeline_df["Vaccine"].unique())
+                grid_chart = _build_vaccine_grid_chart(vaccine_order)
+                base_chart = alt.Chart(overlay_timeline_df).encode(
+                    x=alt.X("Event Date:T", axis=alt.Axis(grid=False)),
+                    y=alt.Y("Vaccine:N", sort=vaccine_order, axis=alt.Axis(grid=False)),
+                    tooltip=["Event Date:T", "Vaccine:N", "Marker:N", "Program:N", "Detail:N"],
+                )
+                schedule_chart = base_chart.transform_filter(alt.datum.Marker == "Routine schedule").mark_circle(size=130, opacity=0.95).encode(color=alt.value("#e8e8eb"))
+                recorded_chart = base_chart.transform_filter(alt.datum.Marker == "Recorded").mark_circle(size=150).encode(color=alt.value("#4294c2"))
+                recall_chart = base_chart.transform_filter(alt.datum.Marker == "Recall due").mark_circle(size=170).encode(color=alt.value("#ae4f4d"))
+                st.altair_chart(
+                    alt.layer(grid_chart, schedule_chart, recorded_chart, recall_chart)
+                    .resolve_scale(color="independent")
+                    .properties(height=max(220, 34 * overlay_timeline_df["Vaccine"].nunique())),
+                    width="stretch",
+                )
+
+            detail_col1, detail_col2 = st.columns([1.2, 1])
+            with detail_col1:
+                st.markdown(f"### {selected_recall['full_name']}")
+                st.write(f"NHS: `{selected_recall['nhs_number']}`")
+                st.write(f"DOB: {_format_date(selected_recall.get('date_of_birth'))}")
+                st.write(f"Age: {_format_age_from_dob(selected_recall.get('date_of_birth'))}")
+                st.write(f"Phone: {selected_recall.get('phone') or '—'}")
+                st.write(f"Email: {selected_recall.get('email') or '—'}")
+                if selected_recall.get("surgery_code"):
+                    st.write(f"Surgery: `{selected_recall['surgery_code']}`")
+                st.write(f"Vaccines: `{selected_recall['vaccines_display']}`")
+                st.write(f"Status: `{selected_recall['status']}`")
+                st.write(f"Due Date: {_format_date(selected_recall.get('due_date'))}")
+                st.write(f"Priority: `{selected_recall['priority']}`")
+                due_items = list(selected_recall.get("due_items") or [])
+                if due_items and len({str(item.get('due_date') or '') for item in due_items}) > 1:
+                    st.write("Original due dates:")
+                    for due_item in due_items:
+                        st.write(
+                            f"- {due_item.get('vaccine') or 'Unknown'}: {_format_date(due_item.get('due_date'))}"
+                        )
+                for reason in selected_recall["reasons"]:
+                    st.write(f"- {reason}")
+            with detail_col2:
+                st.markdown("### Metadata")
+                st.json(selected_recall.get("explanation") or {})
+
+            if attempts:
+                attempts_df = pd.DataFrame(
                     [
                         {
-                            "Patient": row["Patient"],
-                            "Phone": row["Phone"] or "—",
-                            "Email": row["Email"] or "—",
-                            "Vaccines": row["Vaccines"],
-                            "Due Date": row["Due Date"],
+                            "Sent At": _format_ts(attempt.get("sent_at")),
+                            "Method": attempt.get("communication_method") or "—",
+                            "Outcome": attempt.get("outcome") or "—",
+                            "Staff": attempt.get("staff_member") or "—",
+                            "Recall Items": attempt.get("recommendation_count") or "—",
+                            "Message": attempt.get("notes") or "—",
                         }
-                        for row in selected_batch_rows
+                        for attempt in attempts
                     ]
-                ),
-                width="stretch",
-                hide_index=True,
-            )
-            with st.form("create_recall_batch"):
-                batch_title = st.text_input(
-                    "Batch title",
-                    placeholder="e.g. March shingles catch-up",
-                    help="Optional. Prepended to the generated batch label so it is easier to find later.",
                 )
-                batch_staff = st.text_input("Prepared by", value=user_context.full_name or user_context.email)
-                create_batch = st.form_submit_button("Create recall batch", type="primary", icon=":material/batch_prediction:")
+                st.dataframe(attempts_df, width="stretch", hide_index=True)
+            else:
+                st.caption("No recall attempts have been logged for this patient recall yet.")
 
-            if create_batch:
+            action_col1, action_col2 = st.columns(2)
+            if action_col1.button("Mark complete", key=f"complete_{selected_recall['group_id']}", width="stretch", icon=":material/done_outline:"):
                 try:
-                    normalized_batch_title = str(batch_title or "").strip()
-                    selected_surgery_ids = {
-                        recall_map[group_id].get("surgery_id")
-                        for group_id in batch_group_ids
-                        if recall_map[group_id].get("surgery_id")
-                    }
-                    if len(selected_surgery_ids) != 1:
-                        raise ValueError("Recall batch preparation must be scoped to a single surgery.")
-                    batch_result = store.create_recall_batch(
-                        user_context=user_context,
-                        surgery_id=str(next(iter(selected_surgery_ids))),
-                        prepared_by_name=batch_staff,
-                        selected_rows=selected_batch_rows,
-                        selection_summary={
-                            "batch_title": normalized_batch_title,
-                            "statuses": status_filter,
-                            "workflow_filter": workflow_filter,
-                            "vaccine_filter": vaccine_filter,
-                            "search_filter": search_filter,
-                            "age_range": [worklist_min_age, worklist_max_age],
-                            "selected_group_ids": batch_group_ids,
-                        },
-                        self_book_url=self_book_url,
-                    )
-                except (AuthenticationError, AuthorizationError, RuntimeError, ValueError, Exception) as exc:
+                    store.close_recall_group(user_context, selected_recall["recommendation_ids"], "complete")
+                except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
                     st.error(str(exc))
                 else:
-                    if batch_result.get("deduplicated"):
-                        st.info(
-                            f"Reused existing recall batch {batch_result['id']} instead of creating a duplicate."
-                        )
-                    else:
-                        st.success(
-                            f"Created recall batch {batch_result['id']} with {batch_result.get('selected_count', len(selected_batch_rows))} selected patient recalls."
-                        )
+                    st.success("Recall marked complete.")
                     _invalidate_data_caches()
                     st.rerun()
-        else:
-            st.caption("Select one or more filtered recalls to create a batch.")
+            action_col1.caption("Use when this recall has been resolved and no further action is needed.")
+            if action_col2.button("Suppress recall", key=f"suppress_{selected_recall['group_id']}", width="stretch", icon=":material/close:"):
+                try:
+                    store.close_recall_group(user_context, selected_recall["recommendation_ids"], "suppressed")
+                except (AuthenticationError, AuthorizationError, RuntimeError, ValueError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Recall suppressed.")
+                    _invalidate_data_caches()
+                    st.rerun()
+            action_col2.caption("Use when you want to remove it from the worklist without treating it as completed.")
 
-    with st.expander("4. Deliver Batch", expanded=False, icon=":material/send:"):
-        if recall_batch_error:
-            st.error(f"Generic recall batches are unavailable until `sql/007_recall_batches.sql` is applied: {recall_batch_error}")
-        elif not recall_batches:
-            st.info("No recall batches are available yet. Create one in step 3 first.")
-        else:
-            deliver_batch_id = st.selectbox(
-                "Choose batch to deliver",
-                options=[batch["id"] for batch in recall_batches],
-                format_func=lambda batch_id: _format_batch_label(next(batch for batch in recall_batches if batch["id"] == batch_id)),
-                key="deliver_recall_batch_id",
+    if prepare_batch_expander.open:
+        with prepare_batch_expander:
+            batch_group_ids = st.multiselect(
+                "Select patient recalls for batch",
+                options=list(recall_map),
+                format_func=lambda recall_id: _recall_option_label(recall_map[recall_id]),
+                key="worklist_generic_batch_selection",
+                help="Create a generic recall batch from the filtered cohort. You can choose SMS, email, letter, or call later in the delivery step.",
             )
-            deliver_batch = next(batch for batch in recall_batches if batch["id"] == deliver_batch_id)
-            delivery_method = st.selectbox(
-                "Delivery method",
-                options=["sms", "email", "letter", "call"],
-                index=["sms", "email", "letter", "call"].index(deliver_batch.get("delivery_method") or "sms"),
-                key="deliver_recall_batch_method",
-            )
-            batch_rows = deliver_batch.get("export_rows") or []
-            ready_rows, blocked_rows = _classify_batch_rows_for_method(batch_rows, delivery_method)
-
-            delivery_metric1, delivery_metric2, delivery_metric3 = st.columns(3)
-            delivery_metric1.metric("Selected", f"{len(batch_rows):,}")
-            delivery_metric2.metric("Ready", f"{len(ready_rows):,}")
-            delivery_metric3.metric("Blocked", f"{len(blocked_rows):,}")
-
-            preview_columns = ["Patient", "Phone", "Email", "Vaccines", "Due Date"]
-            if delivery_method == "sms":
-                preview_columns.append("SMS Message")
-            elif delivery_method == "email":
-                preview_columns.extend(["Email Subject", "Email Message"])
-            st.dataframe(
-                pd.DataFrame([{column: row.get(column) or "—" for column in preview_columns} for row in batch_rows]),
-                width="stretch",
-                hide_index=True,
-            )
-
-            if blocked_rows:
+            if batch_group_ids:
+                selected_batch_rows = [batch_candidate_map[recall_id] for recall_id in batch_group_ids]
                 st.dataframe(
                     pd.DataFrame(
                         [
                             {
-                                "Patient": row.get("Patient") or "—",
-                                "Phone": row.get("Phone") or "—",
-                                "Email": row.get("Email") or "—",
-                                "Exclusion": row.get("Exclusion") or "—",
+                                "Patient": row["Patient"],
+                                "Phone": row["Phone"] or "—",
+                                "Email": row["Email"] or "—",
+                                "Vaccines": row["Vaccines"],
+                                "Due Date": row["Due Date"],
                             }
-                            for row in blocked_rows
+                            for row in selected_batch_rows
                         ]
                     ),
                     width="stretch",
                     hide_index=True,
                 )
+                with st.form("create_recall_batch"):
+                    batch_title = st.text_input(
+                        "Batch title",
+                        placeholder="e.g. March shingles catch-up",
+                        help="Optional. Prepended to the generated batch label so it is easier to find later.",
+                    )
+                    batch_staff = st.text_input("Prepared by", value=user_context.full_name or user_context.email)
+                    create_batch = st.form_submit_button("Create recall batch", type="primary", icon=":material/batch_prediction:")
 
-            if delivery_method == "sms":
-                sms_rows = [
-                    {
-                        "Patient": row["Patient"],
-                        "NHS Number": row["NHS Number"],
-                        "Firstname": row["Firstname"],
-                        "DOB": row["DOB"],
-                        "Phone": row["Phone"],
-                        "Vaccines": row["Vaccines"],
-                        "Due Date": row["Due Date"],
-                        "Message": row["SMS Message"],
-                        "Recommendation IDs": row["Recommendation IDs"],
-                    }
-                    for row in ready_rows
-                ]
-                accurx_df = _build_accurx_sms_df(sms_rows)
-                st.download_button(
-                    "Download Self-book Accurx CSV",
-                    data=accurx_df.to_csv(index=False),
-                    file_name=f"safestart2_accurx_batch_{deliver_batch_id}.csv",
-                    mime="text/csv",
-                    disabled=accurx_df.empty,
-                    key=f"deliver_batch_sms_accurx_{deliver_batch_id}",
-                )
-                smsworks_payload = build_smsworks_dry_run_payload(sms_rows, sender=sms_sender_id or deliver_batch.get("surgery_code"))
-                with st.expander("The SMS Works", expanded=False):
-                    st.caption("Review provider-ready SMS payloads, then choose whether to send.")
-                    st.download_button(
-                        "Download The SMS Works JSON",
-                        data=json.dumps(smsworks_payload, indent=2),
-                        file_name=f"safestart2_smsworks_batch_{deliver_batch_id}.json",
-                        mime="application/json",
-                    )
-                    live_send_enabled = st.checkbox(
-                        "Actually send these SMS messages via The SMS Works API",
-                        value=False,
-                        key=f"send_recall_batch_sms_live_{deliver_batch_id}",
-                        disabled=not bool(smsworks_settings and smsworks_settings.jwt),
-                    )
-                    if st.button(
-                        "Send batch via The SMS Works",
-                        key=f"send_recall_batch_sms_{deliver_batch_id}",
-                        width="stretch",
-                        type="primary",
-                        icon=":material/sms:",
-                        disabled=not bool(smsworks_settings and smsworks_settings.jwt),
-                    ):
-                        if not live_send_enabled:
-                            st.error("Tick the live-send checkbox before sending the batch.")
-                        elif not smsworks_payload["requests"]:
-                            st.error("There are no valid SMS requests in this batch.")
+                if create_batch:
+                    try:
+                        normalized_batch_title = str(batch_title or "").strip()
+                        selected_surgery_ids = {
+                            recall_map[group_id].get("surgery_id")
+                            for group_id in batch_group_ids
+                            if recall_map[group_id].get("surgery_id")
+                        }
+                        if len(selected_surgery_ids) != 1:
+                            raise ValueError("Recall batch preparation must be scoped to a single surgery.")
+                        batch_result = store.create_recall_batch(
+                            user_context=user_context,
+                            surgery_id=str(next(iter(selected_surgery_ids))),
+                            prepared_by_name=batch_staff,
+                            selected_rows=selected_batch_rows,
+                            selection_summary={
+                                "batch_title": normalized_batch_title,
+                                "statuses": status_filter,
+                                "workflow_filter": workflow_filter,
+                                "vaccine_filter": vaccine_filter,
+                                "search_filter": search_filter,
+                                "age_range": [worklist_min_age, worklist_max_age],
+                                "selected_group_ids": batch_group_ids,
+                            },
+                            self_book_url=self_book_url,
+                        )
+                    except (AuthenticationError, AuthorizationError, RuntimeError, ValueError, Exception) as exc:
+                        st.error(str(exc))
+                    else:
+                        if batch_result.get("deduplicated"):
+                            st.info(
+                                f"Reused existing recall batch {batch_result['id']} instead of creating a duplicate."
+                            )
                         else:
-                            send_result = send_smsworks_requests(smsworks_payload["requests"], jwt=smsworks_settings.jwt)
-                            sent_rows = []
-                            failed_rows = []
-                            for result in send_result["results"]:
-                                patient_name = str(result["metadata"].get("patient") or "Patient")
-                                provider_note = json.dumps(result.get("response") or {}) if result.get("response") else (result.get("error") or "")
-                                notes = f"{result['body'].get('content') or ''} | smsworks={provider_note}" if provider_note else str(result["body"].get("content") or "")
-                                store.log_recall_attempts(
-                                    user_context=user_context,
-                                    recommendation_ids=list(result["metadata"].get("recommendation_ids") or []),
-                                    communication_method="bulk_sms",
-                                    staff_member=user_context.full_name or user_context.email,
-                                    outcome="sent" if result["success"] else "failed",
-                                    notes=notes,
-                                    recall_batch_id=deliver_batch_id,
-                                )
-                                if result["success"]:
-                                    sent_rows.append(result)
-                                    st.toast(f"SMS sent to {patient_name}", icon=":material/sms:")
-                                    st.success(f"SMS sent to {patient_name}", icon=":material/sms:")
-                                else:
-                                    failed_rows.append(result)
-                                    st.toast(f"SMS failed for {patient_name}", icon=":material/error:")
-                                    st.error(f"SMS failed for {patient_name}", icon=":material/error:")
-                            if sent_rows:
-                                store.set_recall_batch_status(user_context, deliver_batch_id, "sent", delivery_method="sms")
-                            elif failed_rows:
-                                store.set_recall_batch_status(user_context, deliver_batch_id, "failed", delivery_method="sms")
-                            if sent_rows and not failed_rows:
-                                st.success(f"Sent {len(sent_rows):,} SMS messages successfully.")
-                            elif failed_rows and not sent_rows:
-                                st.error(f"All SMS sends failed. Failed messages: {len(failed_rows):,}.")
-                            else:
-                                st.warning(f"Partial send complete. Sent {len(sent_rows):,}, failed {len(failed_rows):,}.")
-                            _invalidate_data_caches()
-                            st.rerun()
-            elif delivery_method == "email":
-                email_rows = [
-                    {
-                        "Patient": row["Patient"],
-                        "NHS Number": row["NHS Number"],
-                        "Firstname": row["Firstname"],
-                        "DOB": row["DOB"],
-                        "Phone": row["Phone"],
-                        "Email": row["Email"],
-                        "Reply To": row["Reply To"],
-                        "Subject": row["Email Subject"],
-                        "Message": row["Email Message"],
-                        "Recommendation IDs": row["Recommendation IDs"],
-                    }
-                    for row in ready_rows
-                ]
-                resend_payload = build_resend_requests(
-                    email_rows,
-                    sender_name=deliver_batch.get("sms_sender_id"),
+                            st.success(
+                                f"Created recall batch {batch_result['id']} with {batch_result.get('selected_count', len(selected_batch_rows))} selected patient recalls."
+                            )
+                        _invalidate_data_caches()
+                        st.rerun()
+            else:
+                st.caption("Select one or more filtered recalls to create a batch.")
+
+    if deliver_batch_expander.open:
+        with deliver_batch_expander:
+            if recall_batch_error:
+                st.error(f"Generic recall batches are unavailable until `sql/007_recall_batches.sql` is applied: {recall_batch_error}")
+            elif not recall_batches:
+                st.info("No recall batches are available yet. Create one in step 3 first.")
+            else:
+                deliver_batch_id = st.selectbox(
+                    "Choose batch to deliver",
+                    options=[batch["id"] for batch in recall_batches],
+                    format_func=lambda batch_id: _format_batch_label(next(batch for batch in recall_batches if batch["id"] == batch_id)),
+                    key="deliver_recall_batch_id",
                 )
-                accurx_email_df = _build_accurx_email_df(email_rows)
-                st.download_button(
-                    "Download Accurx Self-book Links CSV",
-                    data=accurx_email_df.to_csv(index=False),
-                    file_name=f"safestart2_accurx_email_batch_{deliver_batch_id}.csv",
-                    mime="text/csv",
-                    disabled=accurx_email_df.empty,
-                    key=f"deliver_batch_email_accurx_{deliver_batch_id}",
+                deliver_batch = next(batch for batch in recall_batches if batch["id"] == deliver_batch_id)
+                delivery_method = st.selectbox(
+                    "Delivery method",
+                    options=["sms", "email", "letter", "call"],
+                    index=["sms", "email", "letter", "call"].index(deliver_batch.get("delivery_method") or "sms"),
+                    key="deliver_recall_batch_method",
                 )
-                with st.expander("Resend", expanded=False):
-                    st.caption(
-                        f"Emails are sent from `{resend_payload['summary']['sender']}` and reply to the surgery contact email."
+                batch_rows = deliver_batch.get("export_rows") or []
+                ready_rows, blocked_rows = _classify_batch_rows_for_method(batch_rows, delivery_method)
+
+                delivery_metric1, delivery_metric2, delivery_metric3 = st.columns(3)
+                delivery_metric1.metric("Selected", f"{len(batch_rows):,}")
+                delivery_metric2.metric("Ready", f"{len(ready_rows):,}")
+                delivery_metric3.metric("Blocked", f"{len(blocked_rows):,}")
+
+                preview_columns = ["Patient", "Phone", "Email", "Vaccines", "Due Date"]
+                if delivery_method == "sms":
+                    preview_columns.append("SMS Message")
+                elif delivery_method == "email":
+                    preview_columns.extend(["Email Subject", "Email Message"])
+                st.dataframe(
+                    pd.DataFrame([{column: row.get(column) or "—" for column in preview_columns} for row in batch_rows]),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+                if blocked_rows:
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "Patient": row.get("Patient") or "—",
+                                    "Phone": row.get("Phone") or "—",
+                                    "Email": row.get("Email") or "—",
+                                    "Exclusion": row.get("Exclusion") or "—",
+                                }
+                                for row in blocked_rows
+                            ]
+                        ),
+                        width="stretch",
+                        hide_index=True,
                     )
+
+                if delivery_method == "sms":
+                    sms_rows = [
+                        {
+                            "Patient": row["Patient"],
+                            "NHS Number": row["NHS Number"],
+                            "Firstname": row["Firstname"],
+                            "DOB": row["DOB"],
+                            "Phone": row["Phone"],
+                            "Vaccines": row["Vaccines"],
+                            "Due Date": row["Due Date"],
+                            "Message": row["SMS Message"],
+                            "Recommendation IDs": row["Recommendation IDs"],
+                        }
+                        for row in ready_rows
+                    ]
+                    accurx_df = _build_accurx_sms_df(sms_rows)
+                    st.download_button(
+                        "Download Self-book Accurx CSV",
+                        data=accurx_df.to_csv(index=False),
+                        file_name=f"safestart2_accurx_batch_{deliver_batch_id}.csv",
+                        mime="text/csv",
+                        disabled=accurx_df.empty,
+                        key=f"deliver_batch_sms_accurx_{deliver_batch_id}",
+                    )
+                    smsworks_payload = build_smsworks_dry_run_payload(sms_rows, sender=sms_sender_id or deliver_batch.get("surgery_code"))
+                    with st.expander("The SMS Works", expanded=False):
+                        st.caption("Review provider-ready SMS payloads, then choose whether to send.")
+                        st.download_button(
+                            "Download The SMS Works JSON",
+                            data=json.dumps(smsworks_payload, indent=2),
+                            file_name=f"safestart2_smsworks_batch_{deliver_batch_id}.json",
+                            mime="application/json",
+                        )
+                        live_send_enabled = st.checkbox(
+                            "Actually send these SMS messages via The SMS Works API",
+                            value=False,
+                            key=f"send_recall_batch_sms_live_{deliver_batch_id}",
+                            disabled=not bool(smsworks_settings and smsworks_settings.jwt),
+                        )
+                        if st.button(
+                            "Send batch via The SMS Works",
+                            key=f"send_recall_batch_sms_{deliver_batch_id}",
+                            width="stretch",
+                            type="primary",
+                            icon=":material/sms:",
+                            disabled=not bool(smsworks_settings and smsworks_settings.jwt),
+                        ):
+                            if not live_send_enabled:
+                                st.error("Tick the live-send checkbox before sending the batch.")
+                            elif not smsworks_payload["requests"]:
+                                st.error("There are no valid SMS requests in this batch.")
+                            else:
+                                send_result = send_smsworks_requests(smsworks_payload["requests"], jwt=smsworks_settings.jwt)
+                                sent_rows = []
+                                failed_rows = []
+                                for result in send_result["results"]:
+                                    patient_name = str(result["metadata"].get("patient") or "Patient")
+                                    provider_note = json.dumps(result.get("response") or {}) if result.get("response") else (result.get("error") or "")
+                                    notes = f"{result['body'].get('content') or ''} | smsworks={provider_note}" if provider_note else str(result["body"].get("content") or "")
+                                    store.log_recall_attempts(
+                                        user_context=user_context,
+                                        recommendation_ids=list(result["metadata"].get("recommendation_ids") or []),
+                                        communication_method="bulk_sms",
+                                        staff_member=user_context.full_name or user_context.email,
+                                        outcome="sent" if result["success"] else "failed",
+                                        notes=notes,
+                                        recall_batch_id=deliver_batch_id,
+                                    )
+                                    if result["success"]:
+                                        sent_rows.append(result)
+                                        st.toast(f"SMS sent to {patient_name}", icon=":material/sms:")
+                                        st.success(f"SMS sent to {patient_name}", icon=":material/sms:")
+                                    else:
+                                        failed_rows.append(result)
+                                        st.toast(f"SMS failed for {patient_name}", icon=":material/error:")
+                                        st.error(f"SMS failed for {patient_name}", icon=":material/error:")
+                                if sent_rows:
+                                    store.set_recall_batch_status(user_context, deliver_batch_id, "sent", delivery_method="sms")
+                                elif failed_rows:
+                                    store.set_recall_batch_status(user_context, deliver_batch_id, "failed", delivery_method="sms")
+                                if sent_rows and not failed_rows:
+                                    st.success(f"Sent {len(sent_rows):,} SMS messages successfully.")
+                                elif failed_rows and not sent_rows:
+                                    st.error(f"All SMS sends failed. Failed messages: {len(failed_rows):,}.")
+                                else:
+                                    st.warning(f"Partial send complete. Sent {len(sent_rows):,}, failed {len(failed_rows):,}.")
+                                _invalidate_data_caches()
+                                st.rerun()
+                elif delivery_method == "email":
+                    email_rows = [
+                        {
+                            "Patient": row["Patient"],
+                            "NHS Number": row["NHS Number"],
+                            "Firstname": row["Firstname"],
+                            "DOB": row["DOB"],
+                            "Phone": row["Phone"],
+                            "Email": row["Email"],
+                            "Reply To": row["Reply To"],
+                            "Subject": row["Email Subject"],
+                            "Message": row["Email Message"],
+                            "Recommendation IDs": row["Recommendation IDs"],
+                        }
+                        for row in ready_rows
+                    ]
+                    resend_payload = build_resend_requests(
+                        email_rows,
+                        sender_name=deliver_batch.get("sms_sender_id"),
+                    )
+                    accurx_email_df = _build_accurx_email_df(email_rows)
                     st.download_button(
                         "Download Accurx Self-book Links CSV",
                         data=accurx_email_df.to_csv(index=False),
                         file_name=f"safestart2_accurx_email_batch_{deliver_batch_id}.csv",
                         mime="text/csv",
                         disabled=accurx_email_df.empty,
-                        key=f"deliver_batch_email_accurx_resend_{deliver_batch_id}",
+                        key=f"deliver_batch_email_accurx_{deliver_batch_id}",
                     )
-                    st.download_button(
-                        "Download Resend JSON",
-                        data=json.dumps(resend_payload, indent=2),
-                        file_name=f"safestart2_resend_batch_{deliver_batch_id}.json",
-                        mime="application/json",
-                        key=f"deliver_batch_email_resend_json_{deliver_batch_id}",
-                    )
-                    live_send_email = st.checkbox(
-                        "Actually send these emails via Resend",
-                        value=False,
-                        key=f"send_recall_batch_email_live_{deliver_batch_id}",
-                        disabled=not bool(resend_settings and resend_settings.api_key),
-                    )
-                    if st.button(
-                        "Send batch via Resend",
-                        key=f"send_recall_batch_email_{deliver_batch_id}",
-                        width="stretch",
-                        type="primary",
-                        icon=":material/mail:",
-                        disabled=not bool(resend_settings and resend_settings.api_key),
-                    ):
-                        if not live_send_email:
-                            st.error("Tick the live-send checkbox before sending the batch.")
-                        elif not resend_payload["requests"]:
-                            st.error("There are no valid email requests in this batch.")
-                        else:
-                            send_result = send_resend_requests(resend_payload["requests"], api_key=resend_settings.api_key)
-                            sent_rows = []
-                            failed_rows = []
-                            for result in send_result["results"]:
-                                patient_name = str(result["metadata"].get("patient") or "Patient")
-                                subject = str(result["metadata"].get("subject") or "")
-                                email_message = next((row["Message"] for row in email_rows if row["Patient"] == patient_name and row["Subject"] == subject), "")
-                                provider_note = json.dumps(result.get("response") or {}) if result.get("response") else (result.get("error") or "")
-                                notes = f"{subject} | {email_message} | resend={provider_note}" if provider_note else f"{subject} | {email_message}"
-                                store.log_recall_attempts(
-                                    user_context=user_context,
-                                    recommendation_ids=list(result["metadata"].get("recommendation_ids") or []),
-                                    communication_method="email",
-                                    staff_member=user_context.full_name or user_context.email,
-                                    outcome="sent" if result["success"] else "failed",
-                                    notes=notes,
-                                    recall_batch_id=deliver_batch_id,
-                                )
-                                if result["success"]:
-                                    sent_rows.append(result)
-                                    st.toast(f"Email sent to {patient_name}", icon=":material/email:")
-                                    st.success(f"Email sent to {patient_name}", icon=":material/email:")
-                                else:
-                                    failed_rows.append(result)
-                                    st.toast(f"Email failed for {patient_name}", icon=":material/error:")
-                                    st.error(f"Email failed for {patient_name}", icon=":material/error:")
-                            if sent_rows:
-                                store.set_recall_batch_status(user_context, deliver_batch_id, "sent", delivery_method="email")
-                            elif failed_rows:
-                                store.set_recall_batch_status(user_context, deliver_batch_id, "failed", delivery_method="email")
-                            if sent_rows and not failed_rows:
-                                st.success(f"Sent {len(sent_rows):,} emails successfully.")
-                            elif failed_rows and not sent_rows:
-                                st.error(f"All email sends failed. Failed messages: {len(failed_rows):,}.")
+                    with st.expander("Resend", expanded=False):
+                        st.caption(
+                            f"Emails are sent from `{resend_payload['summary']['sender']}` and reply to the surgery contact email."
+                        )
+                        st.download_button(
+                            "Download Accurx Self-book Links CSV",
+                            data=accurx_email_df.to_csv(index=False),
+                            file_name=f"safestart2_accurx_email_batch_{deliver_batch_id}.csv",
+                            mime="text/csv",
+                            disabled=accurx_email_df.empty,
+                            key=f"deliver_batch_email_accurx_resend_{deliver_batch_id}",
+                        )
+                        st.download_button(
+                            "Download Resend JSON",
+                            data=json.dumps(resend_payload, indent=2),
+                            file_name=f"safestart2_resend_batch_{deliver_batch_id}.json",
+                            mime="application/json",
+                            key=f"deliver_batch_email_resend_json_{deliver_batch_id}",
+                        )
+                        live_send_email = st.checkbox(
+                            "Actually send these emails via Resend",
+                            value=False,
+                            key=f"send_recall_batch_email_live_{deliver_batch_id}",
+                            disabled=not bool(resend_settings and resend_settings.api_key),
+                        )
+                        if st.button(
+                            "Send batch via Resend",
+                            key=f"send_recall_batch_email_{deliver_batch_id}",
+                            width="stretch",
+                            type="primary",
+                            icon=":material/mail:",
+                            disabled=not bool(resend_settings and resend_settings.api_key),
+                        ):
+                            if not live_send_email:
+                                st.error("Tick the live-send checkbox before sending the batch.")
+                            elif not resend_payload["requests"]:
+                                st.error("There are no valid email requests in this batch.")
                             else:
-                                st.warning(f"Partial send complete. Sent {len(sent_rows):,}, failed {len(failed_rows):,}.")
-                            _invalidate_data_caches()
-                            st.rerun()
-            else:
-                st.info(
-                    f"`{delivery_method}` does not have a live provider integration in the app. "
-                    "Use step 6 to record manual batch outcomes after handling it outside the app."
-                )
-
-    with st.expander("5. Batch History", expanded=False, icon=":material/history:"):
-        if recall_batch_error:
-            st.error(f"Recall batch history is unavailable until `sql/007_recall_batches.sql` is applied: {recall_batch_error}")
-        elif not recall_batches:
-            st.info("No recall batches are visible for this surgery yet.")
-        else:
-            history_df = pd.DataFrame(
-                [
-                    {
-                        "Batch": str((batch.get("selection_summary") or {}).get("batch_title") or "").strip() or "—",
-                        "Prepared At": _format_ts(batch.get("created_at")),
-                        "Surgery": batch.get("surgery_code") or "—",
-                        "Prepared By": batch.get("prepared_by_name") or batch.get("prepared_by_email") or "—",
-                        "Method": batch.get("delivery_method") or "unassigned",
-                        "Status": batch.get("status") or "—",
-                        "Selected": batch.get("selected_count") or len(batch.get("export_rows") or []),
-                        "Ready": batch.get("ready_count") or 0,
-                        "Blocked": batch.get("blocked_count") or 0,
-                    }
-                    for batch in recall_batches
-                ]
-            )
-            st.dataframe(history_df, width="stretch", hide_index=True)
-            history_batch_id = st.selectbox(
-                "Inspect batch history item",
-                options=[batch["id"] for batch in recall_batches],
-                format_func=lambda batch_id: _format_batch_label(next(batch for batch in recall_batches if batch["id"] == batch_id)),
-                key="history_recall_batch_id",
-            )
-            history_batch = next(batch for batch in recall_batches if batch["id"] == history_batch_id)
-            history_preview_df = pd.DataFrame(history_batch.get("export_rows") or [])
-            if not history_preview_df.empty:
-                st.dataframe(history_preview_df, width="stretch", hide_index=True)
-                export_rows = history_batch.get("export_rows") or []
-                history_method = str(history_batch.get("delivery_method") or "").strip().lower()
-                history_sms_rows = [
-                    {
-                        "NHS Number": row.get("NHS Number"),
-                        "Phone": row.get("Phone"),
-                        "DOB": row.get("DOB"),
-                        "Firstname": row.get("Firstname"),
-                    }
-                    for row in export_rows
-                    if str(row.get("Phone") or "").strip()
-                ]
-                history_email_rows = [
-                    {
-                        "NHS Number": row.get("NHS Number"),
-                        "Phone": row.get("Phone"),
-                        "DOB": row.get("DOB"),
-                        "Firstname": row.get("Firstname"),
-                    }
-                    for row in export_rows
-                    if str(row.get("Phone") or "").strip()
-                ]
-                download_col1, download_col2 = st.columns(2)
-                if history_method in {"", "sms"} and history_sms_rows:
-                    download_col1.download_button(
-                        "Download Self-book Accurx CSV",
-                        data=_build_accurx_sms_df(history_sms_rows).to_csv(index=False),
-                        file_name=f"safestart2_accurx_batch_{history_batch_id}.csv",
-                        mime="text/csv",
-                        key=f"history_batch_sms_accurx_{history_batch_id}",
+                                send_result = send_resend_requests(resend_payload["requests"], api_key=resend_settings.api_key)
+                                sent_rows = []
+                                failed_rows = []
+                                for result in send_result["results"]:
+                                    patient_name = str(result["metadata"].get("patient") or "Patient")
+                                    subject = str(result["metadata"].get("subject") or "")
+                                    email_message = next((row["Message"] for row in email_rows if row["Patient"] == patient_name and row["Subject"] == subject), "")
+                                    provider_note = json.dumps(result.get("response") or {}) if result.get("response") else (result.get("error") or "")
+                                    notes = f"{subject} | {email_message} | resend={provider_note}" if provider_note else f"{subject} | {email_message}"
+                                    store.log_recall_attempts(
+                                        user_context=user_context,
+                                        recommendation_ids=list(result["metadata"].get("recommendation_ids") or []),
+                                        communication_method="email",
+                                        staff_member=user_context.full_name or user_context.email,
+                                        outcome="sent" if result["success"] else "failed",
+                                        notes=notes,
+                                        recall_batch_id=deliver_batch_id,
+                                    )
+                                    if result["success"]:
+                                        sent_rows.append(result)
+                                        st.toast(f"Email sent to {patient_name}", icon=":material/email:")
+                                        st.success(f"Email sent to {patient_name}", icon=":material/email:")
+                                    else:
+                                        failed_rows.append(result)
+                                        st.toast(f"Email failed for {patient_name}", icon=":material/error:")
+                                        st.error(f"Email failed for {patient_name}", icon=":material/error:")
+                                if sent_rows:
+                                    store.set_recall_batch_status(user_context, deliver_batch_id, "sent", delivery_method="email")
+                                elif failed_rows:
+                                    store.set_recall_batch_status(user_context, deliver_batch_id, "failed", delivery_method="email")
+                                if sent_rows and not failed_rows:
+                                    st.success(f"Sent {len(sent_rows):,} emails successfully.")
+                                elif failed_rows and not sent_rows:
+                                    st.error(f"All email sends failed. Failed messages: {len(failed_rows):,}.")
+                                else:
+                                    st.warning(f"Partial send complete. Sent {len(sent_rows):,}, failed {len(failed_rows):,}.")
+                                _invalidate_data_caches()
+                                st.rerun()
+                else:
+                    st.info(
+                        f"`{delivery_method}` does not have a live provider integration in the app. "
+                        "Use step 6 to record manual batch outcomes after handling it outside the app."
                     )
-                if history_method in {"", "email"} and history_email_rows:
-                    download_col2.caption("Self-book CSV is already available via the Accurx CSV download.")
-            history_action_col1, history_action_col2, _ = st.columns([1, 1, 2])
-            if history_action_col1.button(
-                "Suppress recall",
-                key=f"suppress_recall_batch_{history_batch_id}",
-                icon=":material/block:",
-            ):
-                _confirm_suppress_recall_batch_dialog(store, user_context, history_batch)
-            if history_action_col2.button(
-                "Delete batch",
-                key=f"delete_recall_batch_{history_batch_id}",
-                icon=":material/delete:",
-            ):
-                _confirm_delete_recall_batch_dialog(store, user_context, history_batch)
-            with st.expander("Batch filter snapshot", expanded=False):
-                st.json(history_batch.get("selection_summary") or {})
 
-    with st.expander("6. Manual Batch Outcome", expanded=False, icon=":material/attach_file:"):
-        st.caption("Use this when a batch was handled outside the app, for example by letter or phone call.")
-        if recall_batch_error:
-            st.error(f"Manual batch outcomes are unavailable until `sql/007_recall_batches.sql` is applied: {recall_batch_error}")
-        elif not recall_batches:
-            st.info("No recall batches are available to update.")
-        else:
-            with st.form("manual_recall_batch_outcome"):
-                manual_batch_id = st.selectbox(
-                    "Batch",
+    if history_expander.open:
+        with history_expander:
+            if recall_batch_error:
+                st.error(f"Recall batch history is unavailable until `sql/007_recall_batches.sql` is applied: {recall_batch_error}")
+            elif not recall_batches:
+                st.info("No recall batches are visible for this surgery yet.")
+            else:
+                history_df = pd.DataFrame(
+                    [
+                        {
+                            "Batch": str((batch.get("selection_summary") or {}).get("batch_title") or "").strip() or "—",
+                            "Prepared At": _format_ts(batch.get("created_at")),
+                            "Surgery": batch.get("surgery_code") or "—",
+                            "Prepared By": batch.get("prepared_by_name") or batch.get("prepared_by_email") or "—",
+                            "Method": batch.get("delivery_method") or "unassigned",
+                            "Status": batch.get("status") or "—",
+                            "Selected": batch.get("selected_count") or len(batch.get("export_rows") or []),
+                            "Ready": batch.get("ready_count") or 0,
+                            "Blocked": batch.get("blocked_count") or 0,
+                        }
+                        for batch in recall_batches
+                    ]
+                )
+                st.dataframe(history_df, width="stretch", hide_index=True)
+                history_batch_id = st.selectbox(
+                    "Inspect batch history item",
                     options=[batch["id"] for batch in recall_batches],
                     format_func=lambda batch_id: _format_batch_label(next(batch for batch in recall_batches if batch["id"] == batch_id)),
-                    key="manual_recall_batch_id",
+                    key="history_recall_batch_id",
                 )
-                manual_col1, manual_col2, manual_col3 = st.columns(3)
-                manual_method = manual_col1.selectbox("Method", options=["letter", "call", "sms", "email"])
-                manual_outcome = manual_col2.selectbox("Outcome", options=RECALL_OUTCOME_OPTIONS, index=0)
-                manual_staff = manual_col3.text_input("Staff member", value=user_context.full_name or user_context.email)
-                manual_note = st.text_area("Notes for all items in this batch", height=120)
-                apply_manual_batch = st.form_submit_button("Apply manual batch outcome", icon=":material/attach_file:")
+                history_batch = next(batch for batch in recall_batches if batch["id"] == history_batch_id)
+                history_preview_df = pd.DataFrame(history_batch.get("export_rows") or [])
+                if not history_preview_df.empty:
+                    st.dataframe(history_preview_df, width="stretch", hide_index=True)
+                    export_rows = history_batch.get("export_rows") or []
+                    history_method = str(history_batch.get("delivery_method") or "").strip().lower()
+                    history_sms_rows = [
+                        {
+                            "NHS Number": row.get("NHS Number"),
+                            "Phone": row.get("Phone"),
+                            "DOB": row.get("DOB"),
+                            "Firstname": row.get("Firstname"),
+                        }
+                        for row in export_rows
+                        if str(row.get("Phone") or "").strip()
+                    ]
+                    history_email_rows = [
+                        {
+                            "NHS Number": row.get("NHS Number"),
+                            "Phone": row.get("Phone"),
+                            "DOB": row.get("DOB"),
+                            "Firstname": row.get("Firstname"),
+                        }
+                        for row in export_rows
+                        if str(row.get("Phone") or "").strip()
+                    ]
+                    download_col1, download_col2 = st.columns(2)
+                    if history_method in {"", "sms"} and history_sms_rows:
+                        download_col1.download_button(
+                            "Download Self-book Accurx CSV",
+                            data=_build_accurx_sms_df(history_sms_rows).to_csv(index=False),
+                            file_name=f"safestart2_accurx_batch_{history_batch_id}.csv",
+                            mime="text/csv",
+                            key=f"history_batch_sms_accurx_{history_batch_id}",
+                        )
+                    if history_method in {"", "email"} and history_email_rows:
+                        download_col2.caption("Self-book CSV is already available via the Accurx CSV download.")
+                history_action_col1, history_action_col2, _ = st.columns([1, 1, 2])
+                if history_action_col1.button(
+                    "Suppress recall",
+                    key=f"suppress_recall_batch_{history_batch_id}",
+                    icon=":material/block:",
+                ):
+                    _confirm_suppress_recall_batch_dialog(store, user_context, history_batch)
+                if history_action_col2.button(
+                    "Delete batch",
+                    key=f"delete_recall_batch_{history_batch_id}",
+                    icon=":material/delete:",
+                ):
+                    _confirm_delete_recall_batch_dialog(store, user_context, history_batch)
+                with st.expander("Batch filter snapshot", expanded=False):
+                    st.json(history_batch.get("selection_summary") or {})
 
-            if apply_manual_batch:
-                try:
-                    manual_batch = next(batch for batch in recall_batches if batch["id"] == manual_batch_id)
-                    notes_by_row = {
-                        str(row.get("Group ID") or ""): manual_note.strip() or None
-                        for row in (manual_batch.get("export_rows") or [])
-                    }
-                    result = store.log_recall_batch_outcome(
-                        user_context=user_context,
-                        batch_id=manual_batch_id,
-                        communication_method=manual_method,
-                        outcome=manual_outcome,
-                        staff_member=manual_staff,
-                        notes_by_row=notes_by_row,
+    if manual_outcome_expander.open:
+        with manual_outcome_expander:
+            st.caption("Use this when a batch was handled outside the app, for example by letter or phone call.")
+            if recall_batch_error:
+                st.error(f"Manual batch outcomes are unavailable until `sql/007_recall_batches.sql` is applied: {recall_batch_error}")
+            elif not recall_batches:
+                st.info("No recall batches are available to update.")
+            else:
+                with st.form("manual_recall_batch_outcome"):
+                    manual_batch_id = st.selectbox(
+                        "Batch",
+                        options=[batch["id"] for batch in recall_batches],
+                        format_func=lambda batch_id: _format_batch_label(next(batch for batch in recall_batches if batch["id"] == batch_id)),
+                        key="manual_recall_batch_id",
                     )
-                except (AuthenticationError, AuthorizationError, RuntimeError, ValueError, Exception) as exc:
-                    st.error(str(exc))
-                else:
-                    st.success(
-                        f"Updated batch {manual_batch_id} to {result['status']} and logged {result['logged_attempts']} recall attempt rows."
-                    )
-                    _invalidate_data_caches()
-                    st.rerun()
+                    manual_col1, manual_col2, manual_col3 = st.columns(3)
+                    manual_method = manual_col1.selectbox("Method", options=["letter", "call", "sms", "email"])
+                    manual_outcome = manual_col2.selectbox("Outcome", options=RECALL_OUTCOME_OPTIONS, index=0)
+                    manual_staff = manual_col3.text_input("Staff member", value=user_context.full_name or user_context.email)
+                    manual_note = st.text_area("Notes for all items in this batch", height=120)
+                    apply_manual_batch = st.form_submit_button("Apply manual batch outcome", icon=":material/attach_file:")
+
+                if apply_manual_batch:
+                    try:
+                        manual_batch = next(batch for batch in recall_batches if batch["id"] == manual_batch_id)
+                        notes_by_row = {
+                            str(row.get("Group ID") or ""): manual_note.strip() or None
+                            for row in (manual_batch.get("export_rows") or [])
+                        }
+                        result = store.log_recall_batch_outcome(
+                            user_context=user_context,
+                            batch_id=manual_batch_id,
+                            communication_method=manual_method,
+                            outcome=manual_outcome,
+                            staff_member=manual_staff,
+                            notes_by_row=notes_by_row,
+                        )
+                    except (AuthenticationError, AuthorizationError, RuntimeError, ValueError, Exception) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(
+                            f"Updated batch {manual_batch_id} to {result['status']} and logged {result['logged_attempts']} recall attempt rows."
+                        )
+                        _invalidate_data_caches()
+                        st.rerun()
 
 
 def _render_import_tab(
@@ -2940,7 +2957,7 @@ def _render_vaccination_events_tab(
             key="events_surgery_filter",
         )
 
-    refresh_col, toggle_col1, toggle_col2, _ = st.columns([0.18, 0.2, 0.24, 0.38])
+    refresh_col, _, _, _ = st.columns([0.18, 0.2, 0.24, 0.38])
     if refresh_col.button(
         "Refresh data",
         key="events_refresh_data",
@@ -2948,36 +2965,43 @@ def _render_vaccination_events_tab(
     ):
         _invalidate_data_caches()
         st.rerun()
-    exclude_flu_events = toggle_col1.toggle(
-        "Exclude Flu",
-        value=True,
-        key="events_exclude_flu",
-    )
-    exclude_covid_events = toggle_col2.toggle(
-        "Exclude COVID-19",
-        value=True,
-        key="events_exclude_covid19",
-    )
+    with st.form("vaccination_events_filter_form", clear_on_submit=False):
+        _, form_toggle_col1, form_toggle_col2, _ = st.columns([0.18, 0.2, 0.24, 0.38])
+        exclude_flu_events = form_toggle_col1.toggle(
+            "Exclude Flu",
+            value=True,
+            key="events_exclude_flu",
+        )
+        exclude_covid_events = form_toggle_col2.toggle(
+            "Exclude COVID-19",
+            value=True,
+            key="events_exclude_covid19",
+        )
 
-    filter_col1, filter_col2 = st.columns([1, 2])
-    patient_search = filter_col1.text_input(
-        "Patient search",
-        placeholder="Name, NHS, phone, vaccine",
-        key="events_patient_search",
-    )
-    min_age_years, max_age_years = filter_col2.slider(
-        "Patient age range (years)",
-        min_value=0,
-        max_value=120,
-        value=(0, 120),
-        step=1,
-        key="events_age_filter",
-    )
-    include_without_events = st.toggle(
-        "Include patients with no stored events",
-        value=False,
-        key="events_include_without_events",
-    )
+        filter_col1, filter_col2 = st.columns([1, 2])
+        patient_search = filter_col1.text_input(
+            "Patient search",
+            placeholder="Name, NHS, phone, vaccine",
+            key="events_patient_search",
+        )
+        min_age_years, max_age_years = filter_col2.slider(
+            "Patient age range (years)",
+            min_value=0,
+            max_value=120,
+            value=(0, 120),
+            step=1,
+            key="events_age_filter",
+        )
+        include_without_events = st.toggle(
+            "Include patients with no stored events",
+            value=False,
+            key="events_include_without_events",
+        )
+        st.form_submit_button(
+            "Apply filters",
+            type="primary",
+            icon=":material/filter_alt:",
+        )
 
     try:
         patients = _get_cached_vaccination_event_patients(
